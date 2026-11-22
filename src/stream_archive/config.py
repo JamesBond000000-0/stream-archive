@@ -2,6 +2,7 @@ import contextlib
 import copy
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -76,6 +77,70 @@ def telegram_enabled(config: AppConfig) -> bool:
     controls the app, and both can run at once when all values exist.
     """
     return config.telegram_user_id > 0 and bool(config.bot_telegram_api.strip())
+
+
+def parse_hours(text: str) -> float | None:
+    """Hours from text like ``11``, ``11.5``, ``11:50``, or ``11h50m``.
+
+    A colon form and an ``h``/``m`` form both read as hours and minutes, so
+    a split length near the 12-hour archive limit is easy to type. ``None``
+    means the text is not a value. A negative value is returned as it is:
+    the caller rejects it with its own message.
+    """
+    raw = text.strip().lower().replace(" ", "")
+    if not raw:
+        return None
+    if raw.endswith("m") and "h" not in raw:
+        try:
+            minutes = float(raw[:-1])
+        except ValueError:
+            return None
+        if not math.isfinite(minutes) or minutes < 0 or minutes >= 60:
+            return None
+        return minutes / 60
+    if raw.endswith("h") or raw.endswith("m"):
+        hours_text, _, rest = raw.partition("h")
+        minutes_text = rest[:-1] if rest.endswith("m") else rest
+        if not hours_text:
+            hours_text = "0"
+        try:
+            hours = float(hours_text)
+            minutes = float(minutes_text) if minutes_text else 0.0
+        except ValueError:
+            return None
+        if not math.isfinite(hours) or not math.isfinite(minutes) or minutes >= 60:
+            return None
+        return hours + minutes / 60
+    if ":" in raw:
+        hours_text, _, minutes_text = raw.partition(":")
+        try:
+            hours = float(hours_text or 0)
+            minutes = float(minutes_text)
+        except ValueError:
+            return None
+        if not math.isfinite(hours) or not math.isfinite(minutes) or minutes >= 60:
+            return None
+        return hours + minutes / 60
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def format_hours(hours: float) -> str:
+    """``11.83`` as ``11h50m``, and a whole value as ``11h``."""
+    if hours <= 0:
+        return "0"
+    whole = int(hours)
+    minutes = round((hours - whole) * 60)
+    if minutes == 60:
+        whole += 1
+        minutes = 0
+    if minutes == 0:
+        return f"{whole}h"
+    if whole == 0:
+        return f"{minutes}m"
+    return f"{whole}h{minutes:02d}m"
 
 
 def bare_name(channel: str) -> str:
@@ -192,6 +257,17 @@ class YouTubeConfig(BaseModel):
     #: whole stream. YouTube archives a broadcast of 12 hours or less, and
     #: it may capture nothing longer, so 11 is the useful value.
     max_broadcast_hours: NonNegativeFloat = 0
+
+    @field_validator("max_broadcast_hours")
+    @classmethod
+    def _round_split_length(cls, v: NonNegativeFloat) -> NonNegativeFloat:
+        """Keep the split length to the second, the precision of the timer.
+
+        A hand edit can carry a long decimal from a minutes-to-hours
+        conversion (11:50 -> 11.833333333). Rounded to the second, the
+        entry stays readable, and unchanged by a later save.
+        """
+        return round(v, 4)
 
 
 class UpdateCheckConfig(BaseModel):

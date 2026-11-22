@@ -26,9 +26,11 @@ YouTube sets no limit on how long a stream runs, but it archives only a stream o
 
 ```json
 "youtube": {
-    "max_broadcast_hours": 11
+    "max_broadcast_hours": 11.83
 }
 ```
+
+`11.83` is 11 hours 50 minutes. From Telegram, `/split 11:50` sets the same value.
 
 At each boundary the app creates the next broadcast while the current one still runs, starts a second encoder on the same source feed, and ends the old broadcast about 20 seconds later. The feed is read once, so the disk file and the chat capture continue without a break. Each part has its own watch link: YouTube cannot move a broadcast to another video, so the app sends the new link in the Telegram alert.
 

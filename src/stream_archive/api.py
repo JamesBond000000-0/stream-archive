@@ -34,6 +34,7 @@ from stream_archive.config import (
     endpoint_base_url,
     normalize_channel_name,
     normalize_endpoint_url,
+    parse_hours,
 )
 from stream_archive.http_guard import FailBudget, read_json_object
 from stream_archive.telegram.menu_state import is_error
@@ -272,9 +273,13 @@ def _global_hold_seconds(value: Any) -> str:
 
 
 def _hours(value: Any, key: str) -> str:
-    """Validated number of hours: a finite number >= 0."""
+    """Validated hours: a finite number >= 0, or text like 11:50 or 11h50m."""
+    if isinstance(value, str):
+        parsed = parse_hours(value)
+        if parsed is not None:
+            value = parsed
     if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0:
-        msg = f"{key} must be a number of hours >= 0"
+        msg = f"{key} must be hours >= 0 (a number, or text like 11:50 or 11h50m)"
         raise _ApiError(400, msg)
     return str(value)
 

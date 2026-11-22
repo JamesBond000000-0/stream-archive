@@ -647,7 +647,8 @@ const SETTING_DEFS = [
   { key: "youtube_hold_seconds", label: "YouTube hold", hint: "Delay before ending the restream", type: "preset-number",
     presets: [["Off", 0], ["30 s", 30], ["60 s", 60], ["120 s", 120], ["300 s", 300], ["600 s", 600]], unit: "s" },
   { key: "youtube_max_broadcast_hours", label: "Split long restreams", hint: "New broadcast after this many hours, with no gap", type: "preset-number",
-    presets: [["Off", 0], ["6 h", 6], ["8 h", 8], ["10 h", 10], ["11 h", 11]], unit: "h" },
+    presets: [["Off", 0], ["6 h", 6], ["8 h", 8], ["10 h", 10], ["11 h", 11], ["11 h 50 m", 11.8333]],
+    step: 0.0166667, unit: "h" },
   { key: "endpoint_enabled", label: "Panel access", hint: "Reach the panel beyond this machine", type: "bool" },
   { key: "endpoint_public_url", label: "Panel URL", hint: "Public address of your own proxy", type: "text",
     placeholder: "https://example.com" },
@@ -720,6 +721,7 @@ function settingControl(def, current) {  const lab = document.createElement("lab
     const num = document.createElement("input");
     num.type = "number";
     num.min = "0";
+    if (def.step) num.step = String(def.step);
     num.id = "set-" + def.key;
     const match = String(current);
     if (def.presets.some(([, v]) => String(v) === match)) {
@@ -738,8 +740,13 @@ function settingControl(def, current) {  const lab = document.createElement("lab
     get = () => {
       if (sel.value !== "custom") return Number(sel.value);
       const n = Number(num.value);
-      if (num.value.trim() === "" || !Number.isInteger(n) || n < 0) {
-        throw new Error(def.label + " needs a whole number of 0 or more");
+      // A plain preset list holds whole numbers. A step list (the split
+      // length) also takes a fraction of a unit, such as 11 h 50 m.
+      const whole = Number.isInteger(n);
+      if (num.value.trim() === "" || !Number.isFinite(n) || n < 0 || (!def.step && !whole)) {
+        throw new Error(
+          def.label + (def.step ? " needs a number of 0 or more" : " needs a whole number of 0 or more"),
+        );
       }
       return n;
     };
