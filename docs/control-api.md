@@ -129,6 +129,7 @@ The answer never holds a secret. The key and the Telegram bot token stay in `con
 | `disk_max_total_gb` | number ≥ 0 | Archive size cap. `0` disables the cap |
 | `disk_delete_oldest` | `true`, `false` | On a full disk, delete the oldest recordings (`true`) or stop new recordings (`false`) |
 | `youtube_hold_seconds` | whole number ≥ 0 | Global YouTube hold delay in seconds. `0` ends the restream at once |
+| `youtube_max_broadcast_hours` | number ≥ 0 | Split a long restream into new broadcasts of at most this many hours each, with no gap in the feed. `0` keeps one broadcast |
 | `endpoint_enabled` | `true`, `false` | Publish the panel beyond this machine. Enabling needs a saved URL |
 | `endpoint_public_url` | URL or bare hostname | Public address of your own proxy. Saving alone never flips the toggle. Empty clears a saved URL while the endpoint stays off. Ports must be usable (1-65535) |
 | `kick_webhook_enabled` | `true`, `false` | Instant Kick signals and chat |

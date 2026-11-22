@@ -257,6 +257,25 @@ def test_patch_global_hold_applies_and_rejects(tmp_path):
     assert read_file(tmp_path)["youtube"]["hold_seconds"] == 90  # bad keys change nothing
 
 
+def test_patch_split_hours_applies_and_rejects(tmp_path):
+    """The split length is writable from the API, and a bad value changes nothing."""
+    config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
+
+    async def scenario():
+        async with TestClient(TestServer(wh._app)) as client:
+            good = await client.patch("/api/v1/settings", json={"youtube_max_broadcast_hours": 11}, headers=auth())
+            bad = await client.patch("/api/v1/settings", json={"youtube_max_broadcast_hours": -1}, headers=auth())
+            text = await client.patch("/api/v1/settings", json={"youtube_max_broadcast_hours": "soon"}, headers=auth())
+            return good, await bad.json(), bad.status, await text.json(), text.status
+
+    good, bad, bad_status, text, text_status = asyncio.run(scenario())
+    assert good.status == 200
+    assert config.youtube.max_broadcast_hours == 11
+    assert read_file(tmp_path)["youtube"]["max_broadcast_hours"] == 11
+    assert bad_status == 400 and text_status == 400
+    assert read_file(tmp_path)["youtube"]["max_broadcast_hours"] == 11  # bad keys change nothing
+
+
 def test_patch_endpoint_url_saves_without_enabling(tmp_path):
     config, ctrl, _, _, wh, _, _ = make_api(tmp_path)
 

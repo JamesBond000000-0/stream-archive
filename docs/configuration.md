@@ -67,6 +67,7 @@ Keys marked **hand edit** stay read-only over the Telegram bot, the web panel, a
 | `update_check.interval_hours` | no, hand edit | `24` | Hours between update checks |
 | `youtube.client_secrets_file` | no, hand edit | `client_secret.json` | Path to the Google OAuth client file |
 | `youtube.privacy_status` | no, hand edit | `unlisted` | Privacy of created YouTube broadcasts and VOD uploads: `public`, `unlisted`, or `private` |
+| `youtube.max_broadcast_hours` | no | `0` | Split one long restream into a chain of broadcasts of at most this many hours each. The next broadcast starts before the old one ends, so the live feed has no gap. Viewers of the old link move to the new one. `0` keeps one broadcast. YouTube archives a broadcast of 12 hours or less and may capture nothing longer, so `11` is the useful value |
 | `youtube.hold_seconds` | no, hand edit | `0` | Keep the broadcast open this many seconds after the source stops. A return within the delay reuses the same broadcast. `0` ends the broadcast at once |
 | `channel_youtube_hold_seconds` | no | `{}` | Per-channel override of `youtube.hold_seconds`, for example `{"twitch:channel": 60}`. An absent entry uses the global value. A bare key means `twitch:` |
 | `channel_youtube_vod_upload` | no | `{}` | Per-channel YouTube auto-upload of finished recordings, for example `{"twitch:channel": true}`. An absent entry means off |

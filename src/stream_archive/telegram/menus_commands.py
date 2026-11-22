@@ -33,6 +33,7 @@ class CommandsMixin:
     handle_disk: Any
     handle_chat: Any
     handle_global_hold: Any
+    handle_split_hours: Any
     handle_channel_vod_upload: Any
     _open_recordings: Any
     menu_text: Any
@@ -59,6 +60,7 @@ class CommandsMixin:
             BotCommand("disk", "Show or set disk limits"),
             BotCommand("chat", "Toggle live chat recording"),
             BotCommand("hold", "Set global YouTube hold delay in seconds"),
+            BotCommand("split", "Split a long YouTube restream into new broadcasts"),
             BotCommand("vodupload", "Set per-channel YouTube auto-upload (on, off)"),
             BotCommand("recordings", "Browse stored recordings"),
             BotCommand("settings", "Open the settings menu (reply keyboard buttons)"),
@@ -147,6 +149,11 @@ class CommandsMixin:
     async def _cmd_hold(self, update: Any, context: Any) -> None:
         await update.effective_message.reply_text(
             self.handle_global_hold(context.args or [], chat_id=self._chat_of(update))
+        )
+
+    async def _cmd_split(self, update: Any, context: Any) -> None:
+        await update.effective_message.reply_text(
+            self.handle_split_hours(context.args or [], chat_id=self._chat_of(update))
         )
 
     async def _cmd_vodupload(self, update: Any, context: Any) -> None:

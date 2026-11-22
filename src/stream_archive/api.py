@@ -73,6 +73,7 @@ _SETTING_KEYS = (
     "disk_max_total_gb",
     "disk_delete_oldest",
     "youtube_hold_seconds",
+    "youtube_max_broadcast_hours",
     "endpoint_enabled",
     "endpoint_public_url",
     "kick_webhook_enabled",
@@ -131,6 +132,7 @@ def _settings_json(config: AppConfig) -> dict[str, Any]:
         "youtube": {
             "privacy_status": config.youtube.privacy_status,
             "hold_seconds": config.youtube.hold_seconds,
+            "max_broadcast_hours": config.youtube.max_broadcast_hours,
         },
         "disk": {
             "max_total_gb": config.disk.max_total_gb,
@@ -267,6 +269,14 @@ def _global_hold_seconds(value: Any) -> str:
         msg = "youtube_hold_seconds must be a whole number of seconds >= 0"
         raise _ApiError(400, msg)
     return str(int(value))
+
+
+def _hours(value: Any, key: str) -> str:
+    """Validated number of hours: a finite number >= 0."""
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0:
+        msg = f"{key} must be a number of hours >= 0"
+        raise _ApiError(400, msg)
+    return str(value)
 
 
 def _vod_upload(value: Any) -> str:
@@ -573,6 +583,8 @@ class ControlAPI:
             return await self._run(ctrl.handle_disk, ["delete_oldest", _switch(value, key)])
         if key == "youtube_hold_seconds":
             return await self._run(ctrl.handle_global_hold, [_global_hold_seconds(value)])
+        if key == "youtube_max_broadcast_hours":
+            return await self._run(ctrl.handle_split_hours, [_hours(value, key)])
         if key == "endpoint_enabled":
             return await self._apply_endpoint_enabled(_switch(value, key) == "on")
         if key == "endpoint_public_url":

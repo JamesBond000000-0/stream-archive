@@ -145,6 +145,24 @@ class SettingsCommands:
 
         return cast(str, self._apply(mutate, lambda c: f"Hold delay set to {n}s (0 = end immediately)", chat_id))
 
+    def handle_split_hours(self, args: list[str], chat_id: int | None = None) -> str:
+        """Set the YouTube split length. The control API also calls this."""
+        err = "\u274c split length must be a number of hours >= 0 (0 = one broadcast)"
+        if len(args) != 1:
+            return "Usage: /split <hours>"
+        try:
+            hours = float(args[0])
+        except ValueError:
+            return err
+        if not math.isfinite(hours) or hours < 0:
+            return err
+
+        def mutate(candidate: AppConfig) -> None:
+            candidate.youtube.max_broadcast_hours = hours
+
+        summary = f"Split length set to {hours:g}h (0 = one broadcast, 11 = under the 12h archive limit)"
+        return cast(str, self._apply(mutate, lambda c: summary, chat_id))
+
     def handle_channel_hold(self, args: list[str], chat_id: int | None = None) -> str:
         if len(args) != 2:
             return "Usage: /channelhold <channel> <seconds|default>"

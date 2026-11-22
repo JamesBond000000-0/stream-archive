@@ -70,6 +70,9 @@ class Recording(TypedDict, total=False):
     watchdog: asyncio.Task[Any] | None
     failed: bool
     reused: bool
+    #: Monotonic start of the current YouTube broadcast. It moves at each
+    #: split, while ``started_at`` stays at the start of the whole capture.
+    part_started_at: float
 
 
 class HoldState(TypedDict):

@@ -20,4 +20,16 @@ Under Docker, the localhost redirect cannot reach the container. Always paste th
 
 The token refreshes automatically while it is refreshable. If the token expires beyond refresh, run the command again.
 
+## Long restreams
+
+YouTube sets no limit on how long a stream runs, but it archives only a stream of 12 hours or less. A longer stream may not be captured at all. For a restream that can run for a day or more, set a split length:
+
+```json
+"youtube": {
+    "max_broadcast_hours": 11
+}
+```
+
+At each boundary the app creates the next broadcast while the current one still runs, starts a second encoder on the same source feed, and ends the old broadcast about 20 seconds later. The feed is read once, so the disk file and the chat capture continue without a break. Each part has its own watch link: YouTube cannot move a broadcast to another video, so the app sends the new link in the Telegram alert.
+
 The same login enables VOD uploads. The **Upload** button on a recording (Telegram **Recordings** menu and web panel) sends the finished file to YouTube as a video. The title comes from the file name. The privacy follows `youtube.privacy_status`. The per-channel auto-upload (`/vodupload`, panel channel card) uploads each finished recording at once. Each upload costs YouTube API quota: one `videos.insert` call per file.

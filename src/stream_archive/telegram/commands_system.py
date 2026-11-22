@@ -60,6 +60,7 @@ class SystemCommands:
             "/disk - show disk limits\n"
             "/chat [on|off] [twitch|kick] - enable or disable live chat recording (add twitch or kick for one platform; off stops in-flight capture)\n"
             "/hold <seconds> - global YouTube hold delay (0 = end immediately)\n"
+            "/split <hours> - split a long YouTube restream into new broadcasts (0 = one broadcast, 11 = under the 12h archive limit)\n"
             "/vodupload <channel> <on|off|default> - YouTube auto-upload of finished recordings\n"
             "/recordings - browse stored recordings (upload or delete)\n"
             "/settings - open the settings menu (reply keyboard buttons)\n"

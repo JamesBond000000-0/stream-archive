@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Coroutine
-from contextlib import nullcontext, suppress
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -593,7 +593,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         if cancelled is not None:
             raise cancelled
 
-    def _spawn_bg(self, coro: Coroutine[Any, Any, Any]) -> None:
+    def _spawn_bg(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
         """Run a finalize coroutine in the background, with a held reference.
 
         The event loop keeps only a weak reference, so a bare task can be
@@ -604,6 +604,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         task = asyncio.create_task(coro)
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_done)
+        return task
 
     def _bg_done(self, task: asyncio.Task[Any]) -> None:
         """Release a finished background task, and log its failure.
@@ -860,95 +861,6 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             )
         return out
 
-    async def _pipe_stream(
-        self,
-        channel: str,
-        stream: Any,
-        process: Any,
-        filepath: str | None,
-        youtube_stop: asyncio.Event | None = None,
-    ) -> tuple[bool, str | None, bool]:
-        """Copy one source stream into ffmpeg stdin and, for ``both``, a file.
-
-        Return ``(clean, youtube_error, youtube_abandoned)``. ``clean`` is
-        True only when the source reached EOF. ``youtube_error`` names an
-        ingest write failure (for example a takedown that closed the RTMP
-        connection), or None when the ingest never broke. A source read
-        failure reports ``(False, None, False)``: the ingest did not fail,
-        the feed did. When ``youtube_stop`` is set (the broadcast was
-        revoked while the ingest stays open), the pipe closes the ffmpeg
-        stdin and keeps writing the disk file alone, reporting
-        ``youtube_abandoned`` True. The disk file keeps every byte written
-        before and after the break, and the caller finalizes it like any
-        other stopped capture.
-        """
-        loop = asyncio.get_running_loop()
-        clean = False
-        youtube_error: str | None = None
-        youtube_abandoned = False
-        stdin = getattr(process, "stdin", None)
-        try:
-            fd = await _open_stream(stream)
-        except Exception as e:
-            logger.error("[recorder] [youtube] %s stream open failed: %s", channel, e)
-            return (False, None, False)
-
-        file_handle = None
-        try:
-            if filepath:
-                os.makedirs(os.path.dirname(filepath), exist_ok=True)
-            with open(filepath, "wb") if filepath else nullcontext() as file_handle:
-                while True:
-                    if youtube_stop is not None and youtube_stop.is_set() and not youtube_abandoned:
-                        youtube_abandoned = True
-                        logger.warning("[recorder] [youtube] %s broadcast revoked, stopping the ingest feed", channel)
-                        if stdin is not None:
-                            with suppress(Exception):
-                                stdin.close()
-                        if filepath is None:
-                            break
-                        continue
-                    try:
-                        data = await loop.run_in_executor(None, fd.read, 65536)
-                    except Exception as e:
-                        logger.error("[recorder] [youtube] %s read error: %s", channel, e)
-                        break
-                    if not data:
-                        clean = True
-                        break
-
-                    if file_handle:
-                        # The archive volume can be slow. Write on the
-                        # executor, like the reads.
-                        await loop.run_in_executor(None, file_handle.write, data)
-
-                    if youtube_abandoned:
-                        continue
-                    if stdin is None:
-                        youtube_error = "ffmpeg is not running"
-                        logger.error("[recorder] [youtube] %s pipe error: %s", channel, youtube_error)
-                        break
-                    try:
-                        stdin.write(data)
-                        await stdin.drain()
-                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
-                        youtube_error = f"YouTube ingest failed: {e}"
-                        logger.warning("[recorder] [youtube] %s %s", channel, youtube_error)
-                        break
-                    except Exception as e:
-                        youtube_error = f"YouTube ingest failed: {e}"
-                        logger.error("[recorder] [youtube] %s %s", channel, youtube_error)
-                        break
-
-                logger.info("[recorder] [youtube] %s pipe finished", channel)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.error("[recorder] [youtube] %s pipe error: %s", channel, e)
-        finally:
-            with suppress(Exception):
-                fd.close()
-            with suppress(Exception):
-                if stdin is not None:
-                    stdin.close()
-        return (clean, youtube_error, youtube_abandoned)
+    async def _open_feed(self, stream: Any) -> Any:
+        """Open the streamlink feed. Raise when it cannot open."""
+        return await _open_stream(stream)

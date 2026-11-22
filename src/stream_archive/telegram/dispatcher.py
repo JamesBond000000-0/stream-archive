@@ -243,6 +243,7 @@ class TelegramController(
             CommandHandler("disk", self._cmd_disk, filters=admin),
             CommandHandler("chat", self._cmd_chat, filters=admin),
             CommandHandler("hold", self._cmd_hold, filters=admin),
+            CommandHandler("split", self._cmd_split, filters=admin),
             CommandHandler("vodupload", self._cmd_vodupload, filters=admin),
             CommandHandler("recordings", self._cmd_recordings, filters=admin),
             CommandHandler("settings", self._cmd_settings, filters=admin),

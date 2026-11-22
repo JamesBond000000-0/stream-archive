@@ -29,6 +29,7 @@ The app validates each change and writes it atomically to `config.json`. The cha
 | `/chat [on\|off] [twitch\|kick]` | Show whether chat recording is on, or set it (globally, or for one platform with `twitch`/`kick`). `off` stops chat capture in flight and finalizes it. Video recordings continue |
 | `/disk [maxsize\|delete_oldest] <value>` | Show the disk limits, or set the size cap (`maxsize`) or the delete-oldest behavior (`delete_oldest on\|off`) |
 | `/hold <seconds>` | Set the global YouTube hold delay (`0` ends the restream at once) |
+| `/split <hours>` | Split a long YouTube restream into a chain of broadcasts of at most this many hours each. The next broadcast starts before the old one ends. `0` keeps one broadcast. YouTube archives only a stream of 12 hours or less, so `11` is the useful value |
 | `/vodupload <channel> <on\|off\|default>` | Upload each finished recording of one channel to YouTube at once. `default` clears the override (off) |
 | `/recordings` | Browse stored recordings. Tap a file to send it over MTProto (up to 2 GB) or delete it |
 

@@ -20,6 +20,7 @@ from stream_archive import disk
 from stream_archive.recorder import Recorder, sanitize_filename
 from stream_archive.recorder.core import _ENDED_CLEAN_GRACE_S
 from stream_archive.recorder.streamlink_source import _AudioOnlyStream
+from stream_archive.recorder.youtube_output import _YOUTUBE_DAILY_BUDGET
 
 
 @pytest.fixture(autouse=True)
@@ -428,48 +429,72 @@ class FakeYouTubeStreamer:
         return self.status
 
 
-def test_pipe_stream_clean_eof_returns_true(tmp_path, monkeypatch):
-    rec = Recorder(make_config(tmp_path))
-    process = types.SimpleNamespace(stdin=None)
-    clean, youtube_error, youtube_abandoned = asyncio.run(rec._pipe_stream("ch", FakeStream(), process, None))
-    assert clean is True
-    assert youtube_error is None
-    assert youtube_abandoned is False
+class _OneChunk:
+    """A feed that sends one chunk and then reaches EOF."""
+
+    def __init__(self):
+        self._sent = False
+
+    def open(self):
+        return self
+
+    def read(self, n):
+        if not self._sent:
+            self._sent = True
+            return b"x" * 1024
+        return b""
+
+    def close(self):
+        pass
 
 
-def test_pipe_stream_read_error_returns_false(tmp_path, monkeypatch):
-    rec = Recorder(make_config(tmp_path))
-    process = types.SimpleNamespace(stdin=None)
-    clean, youtube_error, youtube_abandoned = asyncio.run(rec._pipe_stream("ch", RaisingReadStream(), process, None))
-    assert clean is False
-    assert youtube_error is None
-    assert youtube_abandoned is False
-
-
-def test_pipe_stream_reports_youtube_failure_and_keeps_disk_bytes(tmp_path):
-    """An RTMP write failure reports the ingest cause and keeps disk bytes.
-
-    A takedown closes the ingest mid-capture. The pipe must name the
-    ingest as the cause (not the feed), and the disk file must keep the
-    bytes written before the break, so the finalizer archives them.
-    """
+def test_feed_clean_eof_reports_clean(tmp_path):
     rec = Recorder(make_config(tmp_path))
 
-    class OneChunk:
+    class OkStdin:
         def __init__(self):
-            self._sent = False
+            self.writes = 0
 
-        def open(self):
-            return self
+        def write(self, data):
+            self.writes += 1
 
-        def read(self, n):
-            if not self._sent:
-                self._sent = True
-                return b"x" * 1024
-            return b""
+        async def drain(self):
+            pass
 
         def close(self):
             pass
+
+    stdin = OkStdin()
+
+    async def scenario():
+        fd = await rec._open_feed(_OneChunk())
+        return await rec._feed(
+            "ch", "author", "Title", "Game", fd, None, [types.SimpleNamespace(stdin=stdin)], [], asyncio.Event()
+        )
+
+    assert asyncio.run(scenario()) == (True, None)
+    assert stdin.writes == 1
+
+
+def test_feed_read_error_reports_unclean(tmp_path):
+    """A source read failure is not an ingest failure, and not a clean end."""
+    rec = Recorder(make_config(tmp_path))
+
+    async def scenario():
+        fd = await rec._open_feed(RaisingReadStream())
+        return await rec._feed("ch", "author", "Title", "Game", fd, None, [], [], asyncio.Event())
+
+    assert asyncio.run(scenario()) == (False, None)
+
+
+def test_feed_names_a_broken_ingest_and_keeps_disk_bytes(tmp_path):
+    """An RTMP write failure names the ingest and keeps the disk bytes.
+
+    A takedown closes the ingest mid-capture. The feed must report the
+    ingest as the cause (not the source), and the disk file must hold every
+    byte written, so the finalizer archives them.
+    """
+    rec = Recorder(make_config(tmp_path))
 
     class FailingStdin:
         def write(self, data):
@@ -481,43 +506,39 @@ def test_pipe_stream_reports_youtube_failure_and_keeps_disk_bytes(tmp_path):
         def close(self):
             pass
 
-    process = types.SimpleNamespace(stdin=FailingStdin())
     path = str(tmp_path / "out.ts")
+    with open(path, "wb") as file_handle:
 
-    clean, youtube_error, youtube_abandoned = asyncio.run(rec._pipe_stream("ch", OneChunk(), process, path))
+        async def scenario():
+            fd = await rec._open_feed(_OneChunk())
+            return await rec._feed(
+                "ch",
+                "author",
+                "Title",
+                "Game",
+                fd,
+                file_handle,
+                [types.SimpleNamespace(stdin=FailingStdin())],
+                [],
+                asyncio.Event(),
+            )
 
-    assert clean is False
+        clean, youtube_error = asyncio.run(scenario())
+
+    assert clean is True
     assert youtube_error is not None
     assert "ingest" in youtube_error.lower()
-    assert youtube_abandoned is False
     assert os.path.getsize(path) == 1024
 
 
-def test_pipe_stream_stop_event_drops_ingest_and_keeps_disk(tmp_path):
-    """A revoked broadcast stops the ingest while the disk file carries on.
+def test_feed_drops_the_ingest_when_the_broadcast_is_revoked(tmp_path):
+    """A revoked broadcast closes the stdin and keeps copying to disk.
 
-    The watcher sets the stop event when the broadcast flips to revoked.
-    The pipe must close the ffmpeg stdin, skip every later RTMP write, and
-    still copy the full source to disk, reporting the abandonment apart
-    from an ingest failure.
+    The watcher sets the abandoned event when the broadcast flips to
+    revoked. The feed must close the ffmpeg stdin, skip every later RTMP
+    write, and still copy the whole source to disk.
     """
     rec = Recorder(make_config(tmp_path))
-
-    class OneChunk:
-        def __init__(self):
-            self._sent = False
-
-        def open(self):
-            return self
-
-        def read(self, n):
-            if not self._sent:
-                self._sent = True
-                return b"x" * 1024
-            return b""
-
-        def close(self):
-            pass
 
     class DummyStdin:
         def __init__(self):
@@ -534,16 +555,21 @@ def test_pipe_stream_stop_event_drops_ingest_and_keeps_disk(tmp_path):
             self.closed = True
 
     stdin = DummyStdin()
-    process = types.SimpleNamespace(stdin=stdin)
     path = str(tmp_path / "out.ts")
-    stop = asyncio.Event()
-    stop.set()
+    abandoned = asyncio.Event()
+    abandoned.set()
+    with open(path, "wb") as file_handle:
 
-    clean, youtube_error, youtube_abandoned = asyncio.run(rec._pipe_stream("ch", OneChunk(), process, path, stop))
+        async def scenario():
+            fd = await rec._open_feed(_OneChunk())
+            return await rec._feed(
+                "ch", "author", "Title", "Game", fd, file_handle, [types.SimpleNamespace(stdin=stdin)], [], abandoned
+            )
+
+        clean, youtube_error = asyncio.run(scenario())
 
     assert clean is True
     assert youtube_error is None
-    assert youtube_abandoned is True
     assert stdin.writes == 0
     assert stdin.closed is True
     assert os.path.getsize(path) == 1024
@@ -767,12 +793,13 @@ def test_youtube_daily_budget_blocks_and_releases(tmp_path):
     config = make_config(tmp_path)
     config.output_mode = "youtube"
     rec = Recorder(config, youtube_streamer=FakeYouTubeStreamer())
-    # 10 creations inside the rolling 24h window: shared across channels.
-    rec._youtube_starts = [time.time() - i * 60 for i in range(10)]
+    # Every creation inside the rolling 24h window: shared across channels.
+    budget = _YOUTUBE_DAILY_BUDGET
+    rec._youtube_starts = [time.time() - i * 60 for i in range(budget)]
     reason = rec.youtube_restart_blocked_reason("kick:a")
     assert reason is not None
     assert "daily broadcast limit" in reason
-    assert "10/10" in reason
+    assert f"{budget}/{budget}" in reason
     assert rec.youtube_restart_blocked_reason("kick:b") is not None  # global, not per channel
     # One slot ages out of the window: recording is allowed again.
     rec._youtube_starts[0] = time.time() - 90000
@@ -781,7 +808,7 @@ def test_youtube_daily_budget_blocks_and_releases(tmp_path):
 
 def test_youtube_daily_budget_ignores_disk_mode(tmp_path):
     rec = Recorder(make_config(tmp_path))  # output_mode disk
-    rec._youtube_starts = [time.time() - i * 60 for i in range(10)]
+    rec._youtube_starts = [time.time() - i * 60 for i in range(_YOUTUBE_DAILY_BUDGET)]
     assert rec.youtube_restart_blocked_reason("ch") is None
 
 
@@ -2467,7 +2494,7 @@ def test_hold_bypasses_restart_gates(tmp_path, monkeypatch):
             "keepalive": None,
         }
         rec._backoff_until["ch"] = time.monotonic() + 999
-        rec._youtube_starts = [time.time() - i * 60 for i in range(10)]
+        rec._youtube_starts = [time.time() - i * 60 for i in range(_YOUTUBE_DAILY_BUDGET)]
         assert rec.youtube_restart_blocked_reason("ch") is None
         end_task.cancel()
         await asyncio.gather(end_task, return_exceptions=True)
@@ -3045,3 +3072,196 @@ def test_youtube_auth_dead_notifies_and_marks_health(tmp_path, monkeypatch):
         assert degraded()["youtube_auth"] == "YouTube authentication is dead"
     finally:
         clear_degraded("youtube_auth")
+
+
+class SplittingStreamer(FakeYouTubeStreamer):
+    """A streamer that hands out a new broadcast id for each create."""
+
+    def __init__(self):
+        super().__init__()
+        self.created = []
+        self.ended = []
+
+    async def create_stream(self, author, title, channel, game):
+        index = len(self.created) + 1
+        info = {
+            "youtube_url": f"https://youtu.be/b{index}",
+            "rtmp_url": f"rtmp://ingest/b{index}",
+            "broadcast_id": f"b{index}",
+        }
+        self.created.append(info)
+        return info
+
+    async def end_stream(self, broadcast_id):
+        self.ended.append(broadcast_id)
+
+
+class PacedStream:
+    """A feed that sends a chunk every ``delay`` seconds, then EOF."""
+
+    def __init__(self, chunks=4, delay=0.02):
+        self._left = chunks
+        self._delay = delay
+
+    def open(self):
+        return self
+
+    def read(self, n):
+        if self._left <= 0:
+            return b""
+        self._left -= 1
+        time.sleep(self._delay)
+        return b"x" * 1024
+
+    def close(self):
+        pass
+
+
+def _split_recorder(tmp_path, monkeypatch, **overrides):
+    """Build a recorder whose parts last a fraction of a second."""
+    config = make_config(tmp_path, **overrides)
+    config.output_mode = "youtube"
+    config.youtube.max_broadcast_hours = 0.5  # replaced below with a second-scale value
+    yt = SplittingStreamer()
+    notifier = FakeNotifier()
+    rec = Recorder(config, youtube_streamer=yt, notifier=notifier)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr("stream_archive.recorder.youtube_output._HANDOVER_OVERLAP_S", 0.05)
+    return config, yt, notifier, rec
+
+
+def test_split_starts_a_new_broadcast_and_ends_the_old_one(tmp_path, monkeypatch):
+    """A long restream moves to a new broadcast instead of ending.
+
+    The part length is one broadcast's lifetime. At the boundary the
+    recorder must create the next broadcast, feed it, and end the old one
+    afterwards. The disk file must hold the whole source, because the split
+    re-reads nothing.
+    """
+    config, yt, notifier, rec = _split_recorder(tmp_path, monkeypatch)
+    monkeypatch.setattr(rec, "_part_seconds", lambda: 0.05)
+    disk_path = str(tmp_path / "both.ts")
+
+    class SplitProcess:
+        """An ffmpeg stand-in that accepts every write."""
+
+        def __init__(self):
+            self.returncode = None
+            self.stdin = self._Stdin()
+
+        class _Stdin:
+            def __init__(self):
+                self.bytes = 0
+
+            def write(self, data):
+                self.bytes += len(data)
+
+            async def drain(self):
+                pass
+
+            def close(self):
+                pass
+
+        class _Stderr:
+            def __aiter__(self):
+                async def gen():
+                    return
+                    yield
+
+                return gen()
+
+        stderr = _Stderr()
+
+        def terminate(self):
+            self.returncode = 0
+
+        def kill(self):
+            self.returncode = -9
+
+        async def wait(self):
+            return self.returncode
+
+    processes = []
+
+    async def fake_exec(*args, **kwargs):
+        proc = SplitProcess()
+        processes.append((args[-1], proc))
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    async def scenario():
+        rec._recordings["ch"] = {"tasks": [], "youtube_info": None, "filepath": None}
+        rec._recordings["ch"]["youtube_info"] = await yt.create_stream("a", "t", "ch", "g")
+        rec._recordings["ch"]["started_at"] = time.monotonic()
+        rec._recordings["ch"]["part_started_at"] = time.monotonic()
+        await rec._capture_and_restream("ch", "author", "Title", "Game", PacedStream(chunks=10, delay=0.03), disk_path)
+        # Let the overlap tasks finish every superseded broadcast.
+        for _ in range(300):
+            if len(yt.ended) >= len(yt.created) - 1:
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(scenario())
+
+    assert len(yt.created) >= 2  # the boundary created a new broadcast
+    assert processes[0][0] == "rtmp://ingest/b1"  # the first part kept its link
+    # Each part got its own ingest, and every older broadcast was completed.
+    fed = [url for url, _proc in processes]
+    assert len(set(fed)) == len(fed) == len(yt.created)
+    assert set(yt.ended) == {info["broadcast_id"] for info in yt.created[:-1]}
+    # The disk file holds every source byte: the split re-reads nothing.
+    assert os.path.getsize(disk_path) == 10 * 1024
+    assert any("split" in m.lower() for m in notifier.messages)
+
+
+def test_split_off_keeps_one_broadcast(tmp_path, monkeypatch):
+    """With the split off, a long restream keeps its first broadcast.
+
+    ``0`` is the default. The boundary check must then never run, so no
+    second create happens even after many part lengths would have passed.
+    """
+    config, yt, _notifier, rec = _split_recorder(tmp_path, monkeypatch)
+    monkeypatch.setattr(rec, "_part_seconds", lambda: 0.0)
+
+    async def scenario():
+        entry = {"tasks": [], "youtube_info": {"broadcast_id": "b1"}, "started_at": time.monotonic()}
+        assert rec._part_end(entry) is None
+
+    asyncio.run(scenario())
+    assert yt.created == []
+
+
+def test_failed_split_create_keeps_the_current_broadcast(tmp_path, monkeypatch):
+    """A create that fails at the boundary must not end the running restream.
+
+    The operator keeps the current link, and the next boundary tries again.
+    """
+
+    class FlakyStreamer(SplittingStreamer):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def create_stream(self, author, title, channel, game):
+            self.calls += 1
+            if self.calls > 1:
+                msg = "quota exceeded"
+                raise RuntimeError(msg)
+            return await super().create_stream(author, title, channel, game)
+
+    config = make_config(tmp_path, output_mode="youtube")
+    yt = FlakyStreamer()
+    rec = Recorder(config, youtube_streamer=yt)
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+
+    async def scenario():
+        rec._recordings["ch"] = {"tasks": [], "youtube_info": {"broadcast_id": "b1", "rtmp_url": "rtmp://x"}}
+        rec._recordings["ch"]["part_started_at"] = time.monotonic()
+        feeders: list = []
+        info = await rec._start_next_part("ch", "author", "Title", "Game", feeders, [])
+        assert info is None  # no split
+        assert rec._recordings["ch"]["youtube_info"]["broadcast_id"] == "b1"  # still live
+        assert feeders == []
+
+    asyncio.run(scenario())

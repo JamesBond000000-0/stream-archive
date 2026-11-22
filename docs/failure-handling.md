@@ -9,7 +9,8 @@ The app logs each failure, sends an alert, and retries on the next poll cycle. T
 | YouTube rate limit, `403`, or quota error at broadcast creation | Automatic fallback to disk recording. The live alert still goes out |
 | Other YouTube broadcast-creation error | The task fails with an error. Restart on the next cycle |
 | Recording dies mid-stream (ffmpeg killed, disk write error, proxy death, stalled feed) | Entry removed (chat and broadcast finalized). Restart on the next cycle. No alert if the recovery succeeds. A rate-limited alert only if the restart also fails |
-| YouTube restream keeps ending shortly after start (flaky feed) | Restart delays grow for each channel. They double from 120 s to a cap of 30 min. A rolling 24-hour budget of 10 broadcast creations across all channels blocks further restarts until a slot frees (one alert with the next-slot time) |
+| YouTube restream keeps ending shortly after start (flaky feed) | Restart delays grow for each channel. They double from 120 s to a cap of 30 min. A rolling 24-hour budget of 30 broadcast creations across all channels blocks further restarts until a slot frees (one alert with the next-slot time) |
+| YouTube split boundary | The next broadcast is created while the current one runs. Its encoder joins the same source feed, both ingests receive every chunk for about 20 seconds, and the old broadcast ends after that. The new link is live before the old one ends. The disk file and the chat capture continue in one piece. A failed create at the boundary keeps the current broadcast and tries again at the next boundary |
 | Source drops briefly with a hold delay set | The broadcast stays open, fed by a bundled pre-encoded "Reconnecting..." clip. A return within the delay reuses the same broadcast (no new creation, no quota cost). On expiry the broadcast ends as usual |
 | YouTube takes down the live broadcast (status `revoked`) | One alert naming the channel. The app stops feeding the broadcast and starts no new one. The disk recording continues in `both` mode. In `youtube` mode the recording ends with nothing saved |
 | YouTube ingest dies mid-capture | One alert naming the channel and the cause. The disk file stops here and is finalized in `both` mode. The monitor restarts automatically. In `youtube` mode there is no local backup |
@@ -36,6 +37,12 @@ The app logs each failure, sends an alert, and retries on the next poll cycle. T
 | Health endpoint bind fails | Logged with the cause. The app runs without the healthcheck endpoint |
 
 Alerts arrive at most once per 30 minutes for each channel (`FAILURE_NOTIFY_INTERVAL` in `src/stream_archive/monitor.py`).
+
+## Long restreams
+
+YouTube puts no limit on how long a stream runs. It archives a stream of 12 hours or less, and it may capture nothing longer. That is why a long restream belongs in a chain of shorter broadcasts. Set `youtube.max_broadcast_hours` to `11` to get that chain. Each part gets its own watch link, because YouTube cannot move a broadcast to another video. The handover is the closest thing to no gap: the new encoder starts about 20 seconds before the old broadcast ends, fed from the same read of the source.
+
+A split costs one `liveBroadcasts.insert` call. The daily budget is 30 creates across all channels, over a rolling 24 hours. Two channels that each run a day-long stream at 11 hours a part spend 6 creates, well inside the budget. Many flapping restarts are what spends it.
 
 ## Related guides
 

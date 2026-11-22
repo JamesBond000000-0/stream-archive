@@ -187,6 +187,11 @@ class YouTubeConfig(BaseModel):
     privacy_status: Literal["public", "unlisted", "private"] = "unlisted"
     client_secrets_file: str = Field("client_secret.json", min_length=1)
     hold_seconds: NonNegativeFloat = 0
+    #: Split one long restream into a chain of broadcasts of at most this
+    #: many hours each, with a hot handover. 0 keeps one broadcast for the
+    #: whole stream. YouTube archives a broadcast of 12 hours or less, and
+    #: it may capture nothing longer, so 11 is the useful value.
+    max_broadcast_hours: NonNegativeFloat = 0
 
 
 class UpdateCheckConfig(BaseModel):
