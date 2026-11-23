@@ -251,6 +251,19 @@ class YouTubeConfig(BaseModel):
 
     privacy_status: Literal["public", "unlisted", "private"] = "unlisted"
     client_secrets_file: str = Field("client_secret.json", min_length=1)
+    #: Let YouTube end a broadcast when the encoder goes silent (about
+    #: 90 s). The app ends each broadcast itself: at stream end, at hold
+    #: end, and at a split handover. So the default is off. A short feed
+    #: stall, such as a segment gap, then keeps the same broadcast and
+    #: the same link. orphan_cleanup_hours below covers broadcasts that
+    #: a crash leaves behind.
+    enable_auto_stop: StrictBool = False
+    #: End old broadcasts that this app made and that no recording or
+    #: hold owns. A broadcast counts as old when its ingest has no data
+    #: for this many hours. Only broadcasts with the app marker in the
+    #: description count. Broadcasts from other tools stay safe. 0 turns
+    #: the sweep off.
+    orphan_cleanup_hours: NonNegativeFloat = 3
     hold_seconds: NonNegativeFloat = 0
     #: Split one long restream into a chain of broadcasts of at most this
     #: many hours each, with a hot handover. 0 keeps one broadcast for the

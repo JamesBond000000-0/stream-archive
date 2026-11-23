@@ -3,6 +3,11 @@ import contextlib
 import re
 from typing import Any
 
+#: Last line of the description of each broadcast this app makes. The
+#: orphan sweep trusts this line alone: a broadcast without it comes
+#: from another tool and is never a sweep target.
+RECORDED_BY_MARKER = "Recorded by StreamArchive"
+
 #: User credentials inside a URL, for example ``scheme://user:pass@host``.
 #: The match runs to the LAST "@", because a password can hold a raw "@".
 #: A "/", "?" or "#" ends the userinfo, so an "@" in a path or a query

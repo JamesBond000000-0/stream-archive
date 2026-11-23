@@ -76,6 +76,8 @@
     "youtube": {
         "privacy_status": "unlisted",
         "client_secrets_file": "client_secret.json",
+        "enable_auto_stop": false,
+        "orphan_cleanup_hours": 3,
         "hold_seconds": 0,
         "max_broadcast_hours": 0
     }
