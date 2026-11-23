@@ -18,7 +18,7 @@ from stream_archive.config import (
     channel_url,
 )
 from stream_archive.health import clear_degraded, set_degraded
-from stream_archive.recorder.common import sanitize_filename, sanitize_metadata_text
+from stream_archive.recorder.common import RECORDED_BY_MARKER, sanitize_filename, sanitize_metadata_text
 from stream_archive.recorder.types import HoldState, Recording
 
 if TYPE_CHECKING:
@@ -52,6 +52,11 @@ _RECONNECT_CLIP = Path(__file__).resolve().parent.parent / "assets" / "reconnect
 #: shared daily pool for the calls that matter (broadcast creates). The
 #: alert goes to a human, so minute-scale latency costs nothing.
 _STATUS_POLL_S = 120.0
+
+#: Delay between orphan sweeps, in seconds. One sweep costs one
+#: ``liveBroadcasts.list`` unit plus one ``liveStreams.list`` unit per
+#: candidate, so ten minutes keeps the cost near zero.
+_ORPHAN_SWEEP_INTERVAL_S = 600.0
 
 #: How long the old broadcast keeps receiving the feed after the next one
 #: starts. Both ingests hold the live feed in this window, so the new link
@@ -110,6 +115,7 @@ class YoutubeOutputMixin:
     _notifier: Notifier | None
     _recordings: dict[str, Recording]
     _held: dict[str, HoldState]
+    _orphan_first_seen: dict[str, float]
     _quick_ends: dict[str, int]
     _backoff_until: dict[str, float]
     _youtube_starts: list[float]
@@ -873,6 +879,96 @@ class YoutubeOutputMixin:
             raise
         except Exception:
             logger.error("[recorder] broadcast watch failed for %s", channel, exc_info=True)
+
+    def _known_broadcast_ids(self) -> set[str]:
+        """Broadcast ids that a recording or a hold still owns.
+
+        A split moves the entry to the new id at once, and a hold keeps
+        its id here until it ends or a new stream takes it over. Any
+        other active broadcast is not ours to keep alive.
+        """
+        known: set[str] = set()
+        for entry in self._recordings.values():
+            info = entry.get("youtube_info") or {}
+            if info.get("broadcast_id"):
+                known.add(info["broadcast_id"])
+        for hold in self._held.values():
+            info = hold.get("youtube_info") or {}
+            if info.get("broadcast_id"):
+                known.add(info["broadcast_id"])
+        return known
+
+    async def cleanup_orphan_broadcasts(self) -> int:
+        """End broadcasts that a crash or a failed end call left live.
+
+        A broadcast is a candidate when all of these hold: this app made
+        it (the description marker), no recording or hold owns it, and
+        its ingest has no data. The sweep ends a candidate only after it
+        stays a candidate for ``orphan_cleanup_hours``, so a broadcast
+        in setup or in a short gap is safe. The marker guards streams
+        from other tools. The wait guards the rest: a held broadcast is
+        owned, and its keep-alive feed reads as active in any case.
+        Return the count ended. Never raises.
+        """
+        streamer = self._youtube
+        hours = self._config.youtube.orphan_cleanup_hours
+        if streamer is None or hours <= 0:
+            return 0
+        try:
+            broadcasts = await streamer.list_active_broadcasts()
+        except Exception:
+            logger.error("[recorder] [youtube] orphan sweep list failed", exc_info=True)
+            return 0
+        known = self._known_broadcast_ids()
+        now = time.monotonic()
+        cutoff = hours * 3600
+        seen_now: set[str] = set()
+        ended = 0
+        for item in broadcasts:
+            try:
+                broadcast_id = item.get("id")
+                if not isinstance(broadcast_id, str) or broadcast_id in known:
+                    continue
+                snippet = item.get("snippet") or {}
+                if RECORDED_BY_MARKER not in str(snippet.get("description") or ""):
+                    continue
+                details = item.get("contentDetails") or {}
+                stream_id = details.get("boundStreamId")
+                if not isinstance(stream_id, str) or not stream_id:
+                    continue
+                stream_status, health = await streamer.get_stream_health(stream_id)
+                if stream_status != "inactive" or health != "noData":
+                    continue
+                seen_now.add(broadcast_id)
+                first_seen = self._orphan_first_seen.setdefault(broadcast_id, now)
+                if now - first_seen < cutoff:
+                    continue
+                await streamer.end_stream(broadcast_id)
+                ended += 1
+                logger.info(
+                    "[recorder] [youtube] ended orphan broadcast %s (no owner, no data for over %.0f h)",
+                    broadcast_id,
+                    hours,
+                )
+                if self._notifier:
+                    with contextlib.suppress(Exception):
+                        await self._notifier.notify(
+                            f"\U0001f9f9 Ended an orphaned YouTube broadcast: https://www.youtube.com/watch?v={broadcast_id}\n"
+                            "It had no recording and no data on its ingest."
+                        )
+            except Exception:
+                logger.error("[recorder] [youtube] orphan sweep failed for one broadcast", exc_info=True)
+        # Forget candidates that left the list or found an owner, so a
+        # later orphan with a long life does not inherit an old clock.
+        self._orphan_first_seen = {bid: ts for bid, ts in self._orphan_first_seen.items() if bid in seen_now}
+        return ended
+
+    async def run_orphan_cleanup_loop(self) -> None:
+        """Run the orphan sweep on its interval until the task is cancelled."""
+        while True:
+            await asyncio.sleep(_ORPHAN_SWEEP_INTERVAL_S)
+            with contextlib.suppress(Exception):
+                await self.cleanup_orphan_broadcasts()
 
     async def _notify_youtube_takedown(
         self, channel: str, youtube_info: dict[str, Any], title: str | None, has_disk: bool

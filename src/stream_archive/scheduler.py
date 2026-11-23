@@ -144,6 +144,7 @@ async def run_scheduler() -> None:
     telegram: TelegramController | None = None
     mtproto: MtprotoUploader | None = None
     repair_task: asyncio.Task[None] | None = None
+    orphan_task: asyncio.Task[None] | None = None
     upload_hub: Any = None
     # Every resource inside the try below shuts down in order. A failed
     # Telegram start, for example, must not leave a recording or a held
@@ -264,6 +265,7 @@ async def run_scheduler() -> None:
         # finishes that work in the background with no deadline. Boot never
         # waits for it: multi-GB files take minutes.
         repair_task = asyncio.create_task(_repair_after_boot(recorder))
+        orphan_task = asyncio.create_task(recorder.run_orphan_cleanup_loop())
         await _run_loop(monitor, twitch_api, kick_api, config, recorder)
     except asyncio.CancelledError:
         logger.info("[scheduler] Scheduler task cancelled, shutting down")
@@ -283,6 +285,7 @@ async def run_scheduler() -> None:
             shared_http=shared_http,
             mtproto=mtproto,
             repair_task=repair_task,
+            orphan_task=orphan_task,
             upload_hub=upload_hub,
         )
 
@@ -435,6 +438,7 @@ async def _shutdown(
     shared_http: Any,
     mtproto: MtprotoUploader | None = None,
     repair_task: asyncio.Task[None] | None = None,
+    orphan_task: asyncio.Task[None] | None = None,
     upload_hub: Any = None,
 ) -> None:
     """Close everything in order. Each close has its own guard, so one failure never skips the rest.
@@ -453,6 +457,12 @@ async def _shutdown(
             await asyncio.gather(repair_task, return_exceptions=True)
         except Exception:
             logger.error("[scheduler] remux repair cancel failed", exc_info=True)
+    if orphan_task is not None:
+        try:
+            orphan_task.cancel()
+            await asyncio.gather(orphan_task, return_exceptions=True)
+        except Exception:
+            logger.error("[scheduler] orphan sweep cancel failed", exc_info=True)
     if notifier is not None:
         try:
             await notifier.notify_shutdown()

@@ -76,6 +76,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
     _youtube_auth_alerted: bool
     _youtube_budget_lock: asyncio.Lock
     _held: dict[str, HoldState]
+    _orphan_first_seen: dict[str, float]
     _reserve_lock: asyncio.Lock
     _reserved_channels: dict[str, str]
     _bg_tasks: set[asyncio.Task[Any]]
@@ -113,6 +114,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         # record, so concurrent starts cannot all pass the check.
         self._youtube_budget_lock = asyncio.Lock()
         self._held = {}  # channel -> hold dict (broadcast kept open awaiting reuse)
+        self._orphan_first_seen = {}  # broadcast id -> first sweep that saw it orphaned (monotonic)
         self._ended_clean: dict[str, float] = {}  # channel -> monotonic end time (clean stream over)
         #: Final filepath of a clean end, for the monitor auto-upload hook.
         #: Set after finalize (the remux can rename the file) and consumed
