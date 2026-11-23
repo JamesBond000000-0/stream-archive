@@ -3265,3 +3265,71 @@ def test_failed_split_create_keeps_the_current_broadcast(tmp_path, monkeypatch):
         assert feeders == []
 
     asyncio.run(scenario())
+
+
+class FakeTelegramStreamer:
+    def __init__(self, create_error=None):
+        self.create_error = create_error
+        self.ended = []
+
+    async def create_stream(self, author, title, channel, game):
+        if self.create_error:
+            raise self.create_error
+        return {
+            "peer_id": -100777,
+            "call_id": 42,
+            "access_hash": 99,
+            "rtmp_url": "rtmps://dc1-1.rtmp.t.me/s/KEY",
+            "telegram_url": "https://t.me/c/777",
+        }
+
+    async def end_stream(self, telegram_info):
+        self.ended.append(telegram_info)
+
+
+def test_reserve_start_blocks_telegram_at_cap(tmp_path):
+    """The Telegram cap counts active and reserved Telegram restreams."""
+    config = make_config(tmp_path)
+    config.output_mode = "telegram"
+    config.max_concurrent_telegram_streams = 1
+    rec = Recorder(config, telegram_streamer=FakeTelegramStreamer())
+
+    async def scenario():
+        assert await rec.reserve_start("ch") is None
+        reason = await rec.reserve_start("other")
+        assert reason is not None
+        assert "Telegram re-stream limit reached" in reason
+
+    asyncio.run(scenario())
+
+
+def test_telegram_create_failure_propagates_and_removes_entry(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config.output_mode = "telegram"
+    rec = Recorder(config, telegram_streamer=FakeTelegramStreamer(create_error=RuntimeError("boom")))
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (FakeStream(), "author", "Title", "Game"))
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        await wait_until(lambda: not rec.is_recording("ch"))
+        assert not rec.is_recording("ch")
+
+    asyncio.run(scenario())
+
+
+def test_telegram_both_create_failure_falls_back_to_disk(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    config.output_mode = "telegram_both"
+    rec = Recorder(config, telegram_streamer=FakeTelegramStreamer(create_error=RuntimeError("boom")))
+    monkeypatch.setattr(rec, "_load_plugin", lambda: None)
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: (SustainedStream(), "author", "Title", "Game"))
+
+    async def scenario():
+        assert await rec.start("ch") is True
+        assert rec.is_recording("ch")
+        await wait_until(lambda: rec._recordings["ch"]["filepath"] is not None)
+        assert rec._recordings["ch"]["filepath"].startswith(str(tmp_path / "recordings" / "ch"))
+        await rec.stop("ch")
+
+    asyncio.run(scenario())

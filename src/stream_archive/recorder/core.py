@@ -20,6 +20,9 @@ from stream_archive.chat_recorder import ChatRecorder
 from stream_archive.chat_writer import ChatJsonWriter
 from stream_archive.config import (
     AUDIO_ONLY_QUALITY,
+    DISK_MODES,
+    TELEGRAM_MODES,
+    YOUTUBE_MODES,
     AppConfig,
     bare_name,
     channel_url,
@@ -38,11 +41,13 @@ from stream_archive.recorder.remux import (
     remux_ts_to_mp4_async,
 )
 from stream_archive.recorder.streamlink_source import StreamlinkMixin
+from stream_archive.recorder.telegram_output import TelegramOutputMixin
 from stream_archive.recorder.types import HoldState, KickChatState, Recording
 from stream_archive.recorder.youtube_output import YoutubeOutputMixin
 
 if TYPE_CHECKING:
     from stream_archive.notifier import Notifier
+    from stream_archive.telegram_streamer import TelegramLiveStreamer
     from stream_archive.youtube_streamer import YouTubeStreamer
 
 logger = logging.getLogger(__name__)
@@ -60,9 +65,10 @@ def _require_filepath(entry: Recording, channel: str) -> str:
     return disk_filepath
 
 
-class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputMixin):
+class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, TelegramOutputMixin, ChatOutputMixin):
     _config: AppConfig
     _youtube: YouTubeStreamer | None
+    _telegram: TelegramLiveStreamer | None
     _notifier: Notifier | None
     _recordings: dict[str, Recording]
     _locks: dict[str, asyncio.Lock]
@@ -86,9 +92,11 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         config: AppConfig,
         youtube_streamer: YouTubeStreamer | None = None,
         notifier: Notifier | None = None,
+        telegram_streamer: TelegramLiveStreamer | None = None,
     ) -> None:
         self._config = config
         self._youtube = youtube_streamer
+        self._telegram = telegram_streamer
         self._notifier = notifier
         self._recordings = {}
         self._locks = {}
@@ -152,12 +160,19 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             if max_rec > 0 and len(self._recordings) + len(self._reserved_channels) >= max_rec:
                 return f"concurrent recording limit reached ({max_rec}/{max_rec})"
             max_yt = self._config.max_concurrent_youtube_streams
-            if max_yt > 0 and mode in ("youtube", "both"):
+            if max_yt > 0 and mode in YOUTUBE_MODES:
                 yt_busy = self.youtube_active_count() + sum(
-                    1 for m in self._reserved_channels.values() if m in ("youtube", "both")
+                    1 for m in self._reserved_channels.values() if m in YOUTUBE_MODES
                 )
                 if yt_busy >= max_yt:
                     return f"YouTube re-stream limit reached ({max_yt}/{max_yt})"
+            max_tg = self._config.max_concurrent_telegram_streams
+            if max_tg > 0 and mode in TELEGRAM_MODES:
+                tg_busy = self.telegram_active_count() + sum(
+                    1 for m in self._reserved_channels.values() if m in TELEGRAM_MODES
+                )
+                if tg_busy >= max_tg:
+                    return f"Telegram re-stream limit reached ({max_tg}/{max_tg})"
             self._reserved_channels[channel] = mode
             return None
 
@@ -284,12 +299,20 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                 channel,
                 raw_mode,
             )
-        if mode != "disk" and self._youtube is None:
+        if mode in YOUTUBE_MODES and self._youtube is None:
             # Fail before the resolve. Without a streamer the task list stays
             # empty, the entry comes straight back out, and every monitor tick
             # repeats the same silent start.
             logger.error(
                 "[recorder] [%s] Output mode is %s but no YouTube streamer is configured. Check the YouTube settings.",
+                channel,
+                mode,
+            )
+            return False
+        if mode in TELEGRAM_MODES and self._telegram is None:
+            logger.error(
+                "[recorder] [%s] Output mode is %s but no Telegram live streamer is configured. "
+                "Check the telegram_live settings.",
                 channel,
                 mode,
             )
@@ -333,7 +356,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         # not turn into an UnboundLocalError that masks the real error.
         tasks: list[asyncio.Task[Any]] = []
         try:
-            entry: Recording = {"tasks": [], "youtube_info": None, "filepath": None}
+            entry: Recording = {"tasks": [], "youtube_info": None, "telegram_info": None, "filepath": None}
             entry["started_at"] = time.monotonic()
             entry["mode"] = mode
             self._recordings[channel] = entry
@@ -346,7 +369,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             now = datetime.now(ZoneInfo(self._config.timezone)).strftime("%d_%m_%Y-%H%M%S")
             safe_title = sanitize_filename(stream_title)
 
-            if mode in ("disk", "both"):
+            if mode in DISK_MODES:
                 recording_dir = str(disk.channel_recording_dir(self._config, self._channel_dir(channel)))
                 os.makedirs(recording_dir, exist_ok=True)
                 extension = ".m4a" if entry["quality"] == AUDIO_ONLY_QUALITY else ".ts"
@@ -360,7 +383,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                 # The live notification goes out at the end of this method.
                 # A task that ends during that wait then finds its task list
                 # here, and the entry cannot stay behind without a task.
-            elif self._youtube is not None:  # mode youtube or both
+            elif mode in YOUTUBE_MODES and self._youtube is not None:
                 yt_task = self._track(
                     channel,
                     self._stream_youtube(
@@ -375,6 +398,21 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                     ),
                 )
                 tasks.append(yt_task)
+            elif mode in TELEGRAM_MODES and self._telegram is not None:
+                tg_task = self._track(
+                    channel,
+                    self._stream_telegram(
+                        channel,
+                        author,
+                        stream_title,
+                        stream_game,
+                        best,
+                        entry["filepath"] if mode == "telegram_both" else None,
+                        notify=notify,
+                        telegram_notify=youtube_notify,
+                    ),
+                )
+                tasks.append(tg_task)
 
             if not tasks:
                 del self._recordings[channel]
@@ -476,6 +514,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
 
         chat_recorder = entry.pop("chat_recorder", None)
         youtube_info = entry.get("youtube_info")
+        telegram_info = entry.get("telegram_info")
         await self._finalize_entry(channel, entry, chat_recorder, finish_media=finish_media)
 
         filepath = entry.get("filepath")
@@ -493,7 +532,12 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                     "date": mtime.astimezone(ZoneInfo(self._config.timezone)).strftime("%d-%m-%Y %H:%M"),
                 }
 
-        return {"file_info": file_info, "youtube_info": youtube_info, "filepath": filepath}
+        return {
+            "file_info": file_info,
+            "youtube_info": youtube_info,
+            "telegram_info": telegram_info,
+            "filepath": filepath,
+        }
 
     async def restart(self, channel: str) -> bool:
         """Stop and immediately restart a recording with the current config.
@@ -757,6 +801,9 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         youtube_info = entry.get("youtube_info")
         if youtube_info:
             await self._release_broadcast(channel, youtube_info, entry)
+        telegram_info = entry.get("telegram_info")
+        if telegram_info:
+            await self._end_telegram_stream(channel, telegram_info)
         if not finish_media:
             return
         await self._remux_finished_file(entry)

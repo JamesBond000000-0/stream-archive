@@ -880,3 +880,31 @@ def test_category_allowed_match_is_case_insensitive_and_fail_closed():
     assert category_allowed(config, "twitch:other", None) is True
     assert effective_categories(config, "twitch:channel1") == ["Just Chatting"]
     assert effective_categories(config, "twitch:other") is None
+
+
+def test_telegram_live_requires_credentials_when_enabled():
+    with pytest.raises(ValueError, match="telegram_live.api_id"):
+        build(telegram_live={"enabled": True})
+
+
+def test_telegram_live_valid_credentials_pass():
+    config = build(telegram_live={"enabled": True, "api_id": 123, "api_hash": "hash"})
+    assert config.telegram_live.enabled is True
+    assert config.telegram_live.auto_create_channels is True
+    assert config.telegram_live.record is False
+
+
+def test_telegram_modes_are_valid_output_modes():
+    config = build(output_mode="telegram", channel_output_modes={"channel1": "telegram_both"})
+    assert config.output_mode == "telegram"
+    assert config.channel_output_modes == {"twitch:channel1": "telegram_both"}
+
+
+def test_telegram_peers_normalize_keys():
+    config = build(channel_telegram_peers={"channel1": -100777})
+    assert config.channel_telegram_peers == {"twitch:channel1": -100777}
+
+
+def test_telegram_peers_reject_a_zero_peer():
+    with pytest.raises(ValueError, match="channel_telegram_peers"):
+        build(channel_telegram_peers={"channel1": 0})

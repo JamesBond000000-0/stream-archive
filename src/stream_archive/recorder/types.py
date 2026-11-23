@@ -60,6 +60,7 @@ class Recording(TypedDict, total=False):
     user_id: str | None
     filepath: str | None
     youtube_info: dict[str, Any] | None
+    telegram_info: dict[str, Any] | None
     started_at: float
     tasks: list[asyncio.Task[Any]]
     # streamlink ships no type stubs, so the stream objects that feed these

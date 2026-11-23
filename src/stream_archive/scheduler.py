@@ -19,6 +19,7 @@ from stream_archive.mtproto_upload import MtprotoUploader
 from stream_archive.notifier import Notifier, NullNotifier
 from stream_archive.recorder import Recorder
 from stream_archive.telegram import TelegramController
+from stream_archive.telegram_streamer import TelegramLiveStreamer
 from stream_archive.twitch_api import TwitchAPI
 from stream_archive.updater import UpdateChecker, installed_app_version
 from stream_archive.uploads import UploadHub
@@ -135,6 +136,7 @@ async def run_scheduler() -> None:
     twitch_api: TwitchAPI | None = None
     notifier: Notifier | None = None
     youtube_streamer: YouTubeStreamer | None = None
+    telegram_streamer: TelegramLiveStreamer | None = None
     recorder: Recorder | None = None
     kick_api: KickAPI | None = None
     eventsub: EventSubClient | None = None
@@ -162,7 +164,16 @@ async def run_scheduler() -> None:
         youtube_streamer = YouTubeStreamer(config)
         logger.info("YouTube streaming enabled (privacy: %s)", config.youtube.privacy_status)
 
-        recorder = Recorder(config, youtube_streamer, notifier)
+        # Built only when the feature is on: the streamer holds a user
+        # session, and a mode that never uses it must not need one. The
+        # login itself is lazy: the first Telegram restream connects.
+        if config.telegram_live.enabled:
+            telegram_streamer = TelegramLiveStreamer(config)
+            logger.info(
+                "Telegram live streaming enabled (auto-create channels: %s)", config.telegram_live.auto_create_channels
+            )
+
+        recorder = Recorder(config, youtube_streamer, notifier, telegram_streamer=telegram_streamer)
         monitor = Monitor(recorder, notifier)
 
         upload_hub = UploadHub()
@@ -282,6 +293,7 @@ async def run_scheduler() -> None:
             updater_task=updater_task,
             telegram=telegram,
             youtube_streamer=youtube_streamer,
+            telegram_streamer=telegram_streamer,
             shared_http=shared_http,
             mtproto=mtproto,
             repair_task=repair_task,
@@ -436,6 +448,7 @@ async def _shutdown(
     telegram: TelegramController | None,
     youtube_streamer: YouTubeStreamer | None,
     shared_http: Any,
+    telegram_streamer: TelegramLiveStreamer | None = None,
     mtproto: MtprotoUploader | None = None,
     repair_task: asyncio.Task[None] | None = None,
     orphan_task: asyncio.Task[None] | None = None,
@@ -564,6 +577,11 @@ async def _shutdown(
             await youtube_streamer.close()
         except Exception:
             logger.error("[scheduler] youtube streamer close failed", exc_info=True)
+    if telegram_streamer is not None:
+        try:
+            await telegram_streamer.close()
+        except Exception:
+            logger.error("[scheduler] telegram streamer close failed", exc_info=True)
     if notifier is not None:
         try:
             await notifier.close()

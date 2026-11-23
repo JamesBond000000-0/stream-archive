@@ -21,7 +21,13 @@ logger = logging.getLogger(__name__)
 #: Button labels for the settings menus. Each table maps a label to its config
 #: value. The keyboards mark the label of the current value, the handlers turn
 #: a pressed label back into the config value.
-MODE_CHOICES: dict[str, str] = {"Disk": "disk", "YouTube": "youtube", "Both": "both"}
+MODE_CHOICES: dict[str, str] = {
+    "Disk": "disk",
+    "YouTube": "youtube",
+    "Both": "both",
+    "Telegram": "telegram",
+    "Telegram+Disk": "telegram_both",
+}
 QUALITY_CHOICES: dict[str, str] = {
     "Best": "best",
     "1080p": "1080p",
@@ -129,7 +135,10 @@ class SettingsCommands:
 
             return cast(str, self._apply(mutate, lambda c: f"Output mode for {ch} set to {m}", chat_id))
 
-        return "Usage: /mode <disk|youtube|both> or /mode <channel> <disk|youtube|both|default>"
+        return (
+            "Usage: /mode <disk|youtube|both|telegram|telegram_both> "
+            "or /mode <channel> <disk|youtube|both|telegram|telegram_both|default>"
+        )
 
     def handle_global_hold(self, args: list[str], chat_id: int | None = None) -> str:
         """Set the global YouTube hold delay. The control API also calls this."""
@@ -457,6 +466,15 @@ class SettingsCommands:
             "max_concurrent_youtube_streams",
             "Max YouTube re-streams",
             "Usage: /maxyoutube <n> (0 = unlimited)",
+            args,
+            chat_id,
+        )
+
+    def handle_maxtelegram(self, args: list[str], chat_id: int | None = None) -> str:
+        return self._set_count(
+            "max_concurrent_telegram_streams",
+            "Max Telegram re-streams",
+            "Usage: /maxtelegram <n> (0 = unlimited)",
             args,
             chat_id,
         )

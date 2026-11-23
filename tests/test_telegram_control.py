@@ -409,7 +409,10 @@ def test_mode_usage_too_many_args(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     before = read_file(tmp_path)
     text = ctrl.handle_mode(["a", "b", "c"])
-    assert text == "Usage: /mode <disk|youtube|both> or /mode <channel> <disk|youtube|both|default>"
+    assert text == (
+        "Usage: /mode <disk|youtube|both|telegram|telegram_both> "
+        "or /mode <channel> <disk|youtube|both|telegram|telegram_both|default>"
+    )
     assert read_file(tmp_path) == before
 
 
@@ -1181,6 +1184,7 @@ def test_reply_keyboard_channel_layout(tmp_path):
     ]
     assert ctrl.reply_keyboard("channel_mode", "twitch:channel1").to_dict()["keyboard"] == [
         [{"text": "Disk"}, {"text": "YouTube"}, {"text": "Both"}],
+        [{"text": "Telegram"}, {"text": "Telegram+Disk"}],
         [{"text": "\u2713 Global"}],
         [{"text": "Back"}],
     ]
@@ -1261,7 +1265,7 @@ def test_reply_text_channel_submenu_mode(tmp_path):
     assert "global (disk)" in text
     text, markup = asyncio.run(ctrl.handle_reply_text("Mode"))
     assert "Output mode for twitch:channel1: global (disk)" in text
-    assert kb_labels(markup) == ["Disk", "YouTube", "Both", "\u2713 Global", "Back"]
+    assert kb_labels(markup) == ["Disk", "YouTube", "Both", "Telegram", "Telegram+Disk", "\u2713 Global", "Back"]
     text, markup = asyncio.run(ctrl.handle_reply_text("YouTube"))
     assert read_file(tmp_path)["channel_output_modes"] == {"twitch:channel1": "youtube"}
     assert config.channel_output_modes == {"twitch:channel1": "youtube"}

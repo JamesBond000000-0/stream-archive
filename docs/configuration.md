@@ -30,7 +30,7 @@ Keys marked **hand edit** stay read-only over the Telegram bot, the web panel, a
 | `recording_dir` | yes | — | Directory for `.ts`/`.m4a` recordings |
 | `record_chat` | no | `true` | Record Twitch IRC chat alongside the video |
 | `chat_dir` | no | `chat` | Directory for chat JSON files (`chat_dir/<platform>/<channel>/<title>-<ts>.chat.json`). See [Chat recording](chat-recording.md) |
-| `output_mode` | no | `disk` | `disk`, `youtube`, or `both` |
+| `output_mode` | no | `disk` | `disk`, `youtube`, `both`, `telegram`, or `telegram_both` (Telegram live, with a disk copy) |
 | `channel_output_modes` | no | `{}` | Per-channel override, for example `{"twitch:channel": "disk"}`. Channels without an entry use `output_mode`. A bare key means `twitch:` |
 | `eventsub.enabled` | no | `true` | Twitch EventSub fast path through a conduit. It uses the app credentials and needs no extra setup. `false` gives Twitch polling only |
 | `kick.client_id` | yes¹, hand edit | — | Kick app client id. Required with a `kick:` channel |
@@ -60,6 +60,14 @@ Keys marked **hand edit** stay read-only over the Telegram bot, the web panel, a
 | `channel_categories` | no | `{}` | Per-channel category filter, for example `{"twitch:channel": ["Just Chatting", "Music"]}`. Channels without an entry record every live stream. A bare key means `twitch:`. The match ignores case. A blank live category never matches a filter. Hand edits skip the platform check below: the Telegram bot and the control API check each name and refuse unknown names |
 | `max_concurrent_recordings` | no | `0` | Maximum simultaneous recordings. `0` means unlimited |
 | `max_concurrent_youtube_streams` | no | `0` | Maximum simultaneous YouTube restreams. `0` means unlimited |
+| `max_concurrent_telegram_streams` | no | `0` | Maximum simultaneous Telegram restreams. `0` means unlimited |
+| `channel_telegram_peers` | no | `{}` | Monitored channel -> Telegram channel peer id (marked, `-100...`). One Telegram channel holds one live stream at a time, so each monitored channel needs its own entry for parallel restreams. The app adds an entry when it creates a channel. A bare key means `twitch:` |
+| `telegram_live.enabled` | no | `false` | Send restreams to Telegram channels. Needs a user account login. See [Telegram live](telegram-live.md) |
+| `telegram_live.api_id` | yes⁴ | `0` | Telegram app api id from my.telegram.org. Use `${TELEGRAM_API_ID}`. Required when `telegram_live.enabled` is true |
+| `telegram_live.api_hash` | yes⁴ | `""` | Telegram app api hash from my.telegram.org. Use `${TELEGRAM_API_HASH}`. Same requirement |
+| `telegram_live.session` | no, hand edit | `telegram_live.session` | Session file of the Telegram user login, relative to the data dir. Keep it private: it is a full account login |
+| `telegram_live.auto_create_channels` | no | `true` | Create a private Telegram channel when a monitored channel has no entry in `channel_telegram_peers` yet, and store its peer id |
+| `telegram_live.record` | no | `false` | Start the Telegram server-side recording with each live stream. The file lands in the account's Saved Messages when the stream ends |
 | `disk.max_total_gb` | no | `0` | Delete the oldest archive files when the total exceeds this size in GB. `0` disables the cap |
 | `disk.check_interval_s` | no, hand edit | `60` | Seconds between disk watchdog checks |
 | `disk.delete_oldest` | no | `true` | On a breach, delete the oldest archive files. `false` stops new recordings instead |
@@ -77,11 +85,15 @@ Keys marked **hand edit** stay read-only over the Telegram bot, the web panel, a
 ¹ Required when the channel list holds a `kick:` entry.
 ² Required when the endpoint is enabled.
 ³ Required when MTProto upload is enabled.
+⁴ Required when Telegram live is enabled.
 
 `output_mode: youtube` also needs the file `youtube_token.json`. See [YouTube restream](youtube-setup.md).
+
+`output_mode: telegram` and `telegram_both` need `telegram_live.enabled` and a logged-in user session. See [Telegram live](telegram-live.md).
 
 ## Related guides
 
 - [Kick webhook](kick-webhook.md) sets the public URLs for deliveries.
 - [Control API](control-api.md) changes channels and settings over HTTP.
 - [Web panel](web-control.md) replaces the Telegram bot in the browser.
+- [Telegram live](telegram-live.md) restreams to Telegram channels with a user account.
