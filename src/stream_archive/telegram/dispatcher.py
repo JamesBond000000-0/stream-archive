@@ -240,6 +240,7 @@ class TelegramController(
             CommandHandler("category", self._cmd_category, filters=admin),
             CommandHandler("maxrecordings", self._cmd_maxrecordings, filters=admin),
             CommandHandler("maxyoutube", self._cmd_maxyoutube, filters=admin),
+            CommandHandler("maxtelegram", self._cmd_maxtelegram, filters=admin),
             CommandHandler("disk", self._cmd_disk, filters=admin),
             CommandHandler("chat", self._cmd_chat, filters=admin),
             CommandHandler("hold", self._cmd_hold, filters=admin),

@@ -211,6 +211,7 @@ def test_settings_response_holds_no_secrets(tmp_path):
         "retention_days",
         "max_concurrent_recordings",
         "max_concurrent_youtube_streams",
+        "max_concurrent_telegram_streams",
         "record_chat",
         "kick_record_chat",
         "youtube",

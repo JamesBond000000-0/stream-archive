@@ -30,6 +30,7 @@ class CommandsMixin:
     handle_category: Any
     handle_maxrecordings: Any
     handle_maxyoutube: Any
+    handle_maxtelegram: Any
     handle_disk: Any
     handle_chat: Any
     handle_global_hold: Any
@@ -57,6 +58,7 @@ class CommandsMixin:
             BotCommand("category", "Record only these categories (per-channel)"),
             BotCommand("maxrecordings", "Set concurrent recording limit"),
             BotCommand("maxyoutube", "Set YouTube re-stream limit"),
+            BotCommand("maxtelegram", "Set Telegram re-stream limit"),
             BotCommand("disk", "Show or set disk limits"),
             BotCommand("chat", "Toggle live chat recording"),
             BotCommand("hold", "Set global YouTube hold delay in seconds"),
@@ -135,6 +137,11 @@ class CommandsMixin:
     async def _cmd_maxyoutube(self, update: Any, context: Any) -> None:
         await update.effective_message.reply_text(
             self.handle_maxyoutube(context.args or [], chat_id=self._chat_of(update))
+        )
+
+    async def _cmd_maxtelegram(self, update: Any, context: Any) -> None:
+        await update.effective_message.reply_text(
+            self.handle_maxtelegram(context.args or [], chat_id=self._chat_of(update))
         )
 
     async def _cmd_disk(self, update: Any, context: Any) -> None:

@@ -69,6 +69,7 @@ _SETTING_KEYS = (
     "retention_days",
     "max_concurrent_recordings",
     "max_concurrent_youtube_streams",
+    "max_concurrent_telegram_streams",
     "record_chat",
     "kick_record_chat",
     "disk_max_total_gb",
@@ -86,11 +87,11 @@ _SETTING_KEYS = (
 _CHANNEL_SETTING_KEYS = ("output_mode", "quality", "youtube_hold_seconds", "youtube_vod_upload", "categories")
 
 #: Output modes, plus 'default' to clear a per-channel override.
-_OUTPUT_MODES = ("disk", "youtube", "both", "default")
+_OUTPUT_MODES = ("disk", "youtube", "both", "telegram", "telegram_both", "default")
 
 #: Output modes for the global setting. 'default' clears a per-channel
 #: override, so it has no meaning here.
-_GLOBAL_OUTPUT_MODES = ("disk", "youtube", "both")
+_GLOBAL_OUTPUT_MODES = ("disk", "youtube", "both", "telegram", "telegram_both")
 
 
 class _ApiError(Exception):
@@ -128,6 +129,7 @@ def _settings_json(config: AppConfig) -> dict[str, Any]:
         "retention_days": config.retention_days,
         "max_concurrent_recordings": config.max_concurrent_recordings,
         "max_concurrent_youtube_streams": config.max_concurrent_youtube_streams,
+        "max_concurrent_telegram_streams": config.max_concurrent_telegram_streams,
         "record_chat": config.record_chat,
         "kick_record_chat": config.kick.record_chat,
         "youtube": {
@@ -202,7 +204,7 @@ def _switch(value: Any, key: str) -> str:
 def _mode(value: Any) -> str:
     """Validated output mode, or 'default' to clear a per-channel override."""
     if not isinstance(value, str) or value.lower() not in _OUTPUT_MODES:
-        msg = "output_mode must be one of disk, youtube, both, default"
+        msg = "output_mode must be one of disk, youtube, both, telegram, telegram_both, default"
         raise _ApiError(400, msg)
     return value.lower()
 
@@ -214,7 +216,7 @@ def _global_mode(value: Any) -> str:
     as the global mode, so this method rejects it.
     """
     if not isinstance(value, str) or value.lower() not in _GLOBAL_OUTPUT_MODES:
-        msg = "output_mode must be one of disk, youtube, both"
+        msg = "output_mode must be one of disk, youtube, both, telegram, telegram_both"
         raise _ApiError(400, msg)
     return value.lower()
 
@@ -578,6 +580,8 @@ class ControlAPI:
             return await self._run(ctrl.handle_maxrecordings, [_scalar(value, key)])
         if key == "max_concurrent_youtube_streams":
             return await self._run(ctrl.handle_maxyoutube, [_scalar(value, key)])
+        if key == "max_concurrent_telegram_streams":
+            return await self._run(ctrl.handle_maxtelegram, [_scalar(value, key)])
         if key == "record_chat":
             return await self._run(ctrl.handle_chat, [_switch(value, key), "twitch"])
         if key == "kick_record_chat":

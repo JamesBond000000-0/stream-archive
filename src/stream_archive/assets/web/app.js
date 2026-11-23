@@ -429,7 +429,7 @@ async function loadChannels() {
       modeCaption.textContent = "Output mode";
       modeField.appendChild(modeCaption);
       const modeSel = document.createElement("select");
-      for (const m of ["disk", "youtube", "both", "default"]) {
+      for (const m of ["disk", "youtube", "both", "telegram", "telegram_both", "default"]) {
         const o = document.createElement("option");
         o.value = m;
         o.textContent = m === "default" ? "global" : m;
@@ -469,14 +469,14 @@ async function loadChannels() {
           // control, falling back to the effective mode for "global".
           const liveMode = modeSel.value === "default" ? ch.output_mode : modeSel.value;
           let eff = v.toLowerCase();
-          if (eff === "default" && (liveMode === "youtube" || liveMode === "both")) {
+          if (eff === "default" && liveMode !== "disk") {
             // Clearing the override hands control to the global value,
             // which this card cannot see: read it before deciding.
             const s = await api("/api/v1/settings");
             eff = String(s.preferred_quality || "").toLowerCase();
           }
           let prevMode = null;
-          if (eff === "audio_only" && (liveMode === "youtube" || liveMode === "both")) {
+          if (eff === "audio_only" && liveMode !== "disk") {
             if (!window.confirm(audioDiskMessage([ch.channel]))) {
               loadChannels();
               return;
@@ -630,7 +630,7 @@ async function loadChannels() {
 
 const SETTING_DEFS = [
   { key: "output_mode", label: "Output mode", hint: "Where new recordings go", type: "select",
-    options: [["Disk", "disk"], ["YouTube", "youtube"], ["Both", "both"]] },
+    options: [["Disk", "disk"], ["YouTube", "youtube"], ["Both", "both"], ["Telegram", "telegram"], ["Telegram+Disk", "telegram_both"]] },
   { key: "preferred_quality", label: "Preferred quality", hint: "Audio-only records sound and forces disk output", type: "select",
     options: [["Best", "best"], ["1080p", "1080p"], ["720p", "720p"], ["480p", "480p"], ["360p", "360p"], ["Audio only", "audio_only"]] },
   { key: "retention_days", label: "Retention", hint: "Delete recordings older than this", type: "preset-number",
@@ -638,6 +638,8 @@ const SETTING_DEFS = [
   { key: "max_concurrent_recordings", label: "Max recordings", hint: "At the same time", type: "preset-number",
     presets: [["Unlimited", 0], ["1", 1], ["2", 2], ["3", 3], ["5", 5]], unit: "" },
   { key: "max_concurrent_youtube_streams", label: "Max restreams", hint: "At the same time", type: "preset-number",
+    presets: [["Unlimited", 0], ["1", 1], ["2", 2], ["3", 3], ["5", 5]], unit: "" },
+  { key: "max_concurrent_telegram_streams", label: "Max Telegram restreams", hint: "At the same time", type: "preset-number",
     presets: [["Unlimited", 0], ["1", 1], ["2", 2], ["3", 3], ["5", 5]], unit: "" },
   { key: "record_chat", label: "Twitch chat", hint: "Save live chat with the video", type: "bool" },
   { key: "kick_record_chat", label: "Kick chat", hint: "Save live chat with the video", type: "bool" },
@@ -772,6 +774,7 @@ async function loadSettings() {
       retention_days: s.retention_days,
       max_concurrent_recordings: s.max_concurrent_recordings,
       max_concurrent_youtube_streams: s.max_concurrent_youtube_streams,
+      max_concurrent_telegram_streams: s.max_concurrent_telegram_streams,
       record_chat: s.record_chat,
       kick_record_chat: s.kick_record_chat,
       disk_max_total_gb: s.disk.max_total_gb,
@@ -1960,7 +1963,7 @@ document.addEventListener("DOMContentLoaded", () => {
         .filter((c) => {
           const q = String(c.quality_override || payload.preferred_quality || "").toLowerCase();
           const m = String(c.output_mode_override || payload.output_mode || "").toLowerCase();
-          return q === "audio_only" && (m === "youtube" || m === "both");
+          return q === "audio_only" && m !== "disk";
         })
         .map((c) => c.channel);
       if (conflicts.length) {

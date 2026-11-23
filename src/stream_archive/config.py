@@ -44,7 +44,16 @@ KICK_PREFIX = "kick:"
 TWITCH_PREFIX = "twitch:"
 AUDIO_ONLY_QUALITY = "audio_only"
 
-OutputMode = Literal["disk", "youtube", "both"]
+OutputMode = Literal["disk", "youtube", "both", "telegram", "telegram_both"]
+
+#: Output modes that send the capture to a YouTube restream.
+YOUTUBE_MODES = ("youtube", "both")
+
+#: Output modes that send the capture to a Telegram live stream.
+TELEGRAM_MODES = ("telegram", "telegram_both")
+
+#: Output modes that also write the capture to a disk file.
+DISK_MODES = ("disk", "both", "telegram_both")
 
 #: Config keys that moved from kick.webhook to the endpoint section.
 _LEGACY_ENDPOINT_KEYS = (
@@ -412,6 +421,40 @@ class MtprotoConfig(BaseModel):
         return self
 
 
+class TelegramLiveConfig(BaseModel):
+    """Telegram live restream: send captures to Telegram channels.
+
+    A user account runs this feature, not the bot. Bots cannot create a
+    channel, start a live stream, or read its RTMP address. The account
+    must own or manage each target channel. The api id and the api hash
+    identify the app: keep them in env vars, like the bot token. Run
+    ``stream-archive-setup-telegram-live`` once to log the account in.
+    The session file then holds the login.
+    """
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    enabled: StrictBool = False
+    api_id: int = Field(0, ge=0)
+    api_hash: StrictStr = ""
+    session: str = Field("telegram_live.session", min_length=1)
+    #: Create the target channel when a monitored channel has none yet.
+    #: The new channel is private. The app stores its peer id in
+    #: ``channel_telegram_peers`` at once, so a restart reuses it.
+    auto_create_channels: StrictBool = True
+    #: Start the Telegram server-side recording with each live stream.
+    #: The file lands in the account's Saved Messages when the stream
+    #: ends. Off by default: a long stream can pass the file size cap.
+    record: StrictBool = False
+
+    @model_validator(mode="after")
+    def _require_creds_when_enabled(self) -> TelegramLiveConfig:
+        if self.enabled and (self.api_id <= 0 or not self.api_hash.strip()):
+            msg = "telegram_live.api_id and telegram_live.api_hash are required when telegram_live.enabled is true"
+            raise ValueError(msg)
+        return self
+
+
 class AppConfig(BaseModel):
     """Typed, validated view of config.json.
 
@@ -444,6 +487,10 @@ class AppConfig(BaseModel):
     channel_output_modes: dict[str, OutputMode] = {}
     channel_youtube_hold_seconds: dict[str, NonNegativeFloat] = {}
     channel_youtube_vod_upload: dict[str, StrictBool] = {}
+    #: Monitored channel -> Telegram channel peer id (marked, -100...).
+    #: One Telegram channel can hold one live stream at a time, so each
+    #: monitored channel needs its own entry for parallel restreams.
+    channel_telegram_peers: dict[str, StrictInt] = {}
     channel_preferred_qualities: dict[str, str] = {}
     channel_categories: dict[str, list[str]] = {}
     youtube: YouTubeConfig = YouTubeConfig()
@@ -451,12 +498,14 @@ class AppConfig(BaseModel):
     preferred_quality: str = Field("best", min_length=1)
     max_concurrent_recordings: NonNegativeFloat = 0
     max_concurrent_youtube_streams: NonNegativeFloat = 0
+    max_concurrent_telegram_streams: NonNegativeFloat = 0
     record_chat: StrictBool = True
     chat_dir: str = Field("chat", min_length=1)
     disk: DiskConfig = DiskConfig()
     eventsub: EventSubConfig = EventSubConfig()
     endpoint: EndpointConfig = EndpointConfig()
     mtproto: MtprotoConfig = MtprotoConfig()
+    telegram_live: TelegramLiveConfig = TelegramLiveConfig()
     kick: KickConfig = KickConfig()
     api: ApiConfig = ApiConfig()
     web: WebConfig = WebConfig()
@@ -530,6 +579,15 @@ class AppConfig(BaseModel):
     @classmethod
     def _normalize_vod_upload_keys(cls, v: dict[str, StrictBool]) -> dict[str, StrictBool]:
         return _normalize_channel_map(v, "channel_youtube_vod_upload")
+
+    @field_validator("channel_telegram_peers")
+    @classmethod
+    def _normalize_telegram_peer_keys(cls, v: dict[str, StrictInt]) -> dict[str, StrictInt]:
+        for ch, peer in v.items():
+            if peer == 0:
+                msg = f"channel_telegram_peers.{ch} must be a non-zero Telegram peer id"
+                raise ValueError(msg)
+        return _normalize_channel_map(v, "channel_telegram_peers")
 
     @field_validator("channel_categories")
     @classmethod

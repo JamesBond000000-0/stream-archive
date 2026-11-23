@@ -87,7 +87,15 @@ class Notifier:
             else:
                 return
 
-    async def notify_live(self, channel: str, title: str, game: str, url: str, youtube_url: str | None = None) -> None:
+    async def notify_live(
+        self,
+        channel: str,
+        title: str,
+        game: str,
+        url: str,
+        youtube_url: str | None = None,
+        telegram_url: str | None = None,
+    ) -> None:
         from stream_archive import events as _events
 
         # The title and the game name come from the streamer, and this message
@@ -97,6 +105,8 @@ class Notifier:
         text = f"🔴 LIVE: {channel}\nTitle: {title}\nGame: {game}\nUrl: {url}"
         if youtube_url:
             text += f"\nYouTube: {youtube_url}"
+        if telegram_url:
+            text += f"\nTelegram: {telegram_url}"
         _events.record("live", channel, f"{title} · {game}")
         await self._send(text)
 
@@ -164,6 +174,7 @@ class NullNotifier(Notifier):
         game: str,
         url: str,
         youtube_url: str | None = None,
+        telegram_url: str | None = None,
     ) -> None:
         from stream_archive import events as _events
 

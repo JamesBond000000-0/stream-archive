@@ -21,6 +21,7 @@
     "channel_output_modes": {},
     "channel_youtube_hold_seconds": {},
     "channel_youtube_vod_upload": {},
+    "channel_telegram_peers": {},
     "channel_preferred_qualities": {},
     "channel_categories": {},
     "eventsub": {
@@ -60,10 +61,19 @@
         "api_hash": "",
         "session": "mtproto.session"
     },
+    "telegram_live": {
+        "enabled": false,
+        "api_id": 0,
+        "api_hash": "",
+        "session": "telegram_live.session",
+        "auto_create_channels": true,
+        "record": false
+    },
     "retention_days": 0,
     "preferred_quality": "best",
     "max_concurrent_recordings": 0,
     "max_concurrent_youtube_streams": 0,
+    "max_concurrent_telegram_streams": 0,
     "disk": {
         "max_total_gb": 0,
         "check_interval_s": 60,

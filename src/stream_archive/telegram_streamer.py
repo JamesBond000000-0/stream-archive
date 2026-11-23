@@ -1,0 +1,283 @@
+"""Telegram live restream: start channel live streams over MTProto.
+
+A user account runs this module. Bots cannot create a channel, start a
+live stream, or read its RTMP address: those MTProto calls are user-only.
+The account logs in once with ``stream-archive-setup-telegram-live`` and
+the session file holds the login after that. The daemon path never
+prompts: a session that is not logged in fails with a clear error.
+
+One Telegram channel can hold one live stream at a time. Each monitored
+channel maps to its own Telegram channel in ``channel_telegram_peers``.
+When a channel has no target yet and ``auto_create_channels`` is on, the
+app creates a private channel for it and stores its peer id at once.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import secrets
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from stream_archive.config import AppConfig, apply_config_change, bare_name, channel_url
+from stream_archive.recorder.common import sanitize_metadata_text
+
+logger = logging.getLogger(__name__)
+
+#: Message that names the fix when the user session is missing or dead.
+SETUP_HINT = "Run 'stream-archive-setup-telegram-live' first to log in the Telegram user account."
+
+
+def telegram_live_session_path(config: AppConfig) -> Path:
+    """Session file path of the Telegram live client, resolved against the workdir."""
+    p = Path(config.telegram_live.session)
+    if not p.is_absolute():
+        p = config.workdir / p
+    return p
+
+
+def marked_peer_id(raw_id: int) -> int:
+    """Marked peer id of a channel: raw 123 becomes -100123."""
+    return -int(f"100{raw_id}")
+
+
+def join_rtmp_url(url: str, key: str) -> str:
+    """Full RTMP address from the server URL and the stream key.
+
+    Telegram returns the two parts apart, like OBS shows them. The URL
+    can end with or without a slash, and it can already hold the key.
+    """
+    if key and key in url:
+        return url
+    if url.endswith("/"):
+        return f"{url}{key}"
+    return f"{url}/{key}"
+
+
+def _call_from_updates(result: Any) -> Any:
+    """Group call object inside a create result, or None.
+
+    A create answers an Updates object. One of its updates carries the
+    new call with its id and access hash. The end call needs both.
+    """
+    updates = getattr(result, "updates", None)
+    if updates is None and isinstance(result, list):
+        updates = result
+    for update in updates or []:
+        call = getattr(update, "call", None)
+        if call is not None and getattr(call, "id", None) is not None:
+            return call
+    return None
+
+
+def _channel_from_result(result: Any) -> Any:
+    """First chat inside a create-channel result, or None."""
+    chats = getattr(result, "chats", None) or []
+    return chats[0] if chats else None
+
+
+class TelegramLiveStreamer:
+    """MTProto client for Telegram live streams, logged in as a user."""
+
+    def __init__(self, config: AppConfig, client_factory: Callable[..., Any] | None = None) -> None:
+        self._config = config
+        self._client_factory = client_factory
+        self._client: Any = None
+        self._lock = asyncio.Lock()
+        #: Serializes channel creates, so two first-time channels cannot
+        #: race the config save or hit the create rate limit together.
+        self._create_lock = asyncio.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        """True when Telegram live is on and holds its credentials."""
+        live = self._config.telegram_live
+        return bool(live.enabled and live.api_id > 0 and live.api_hash.strip())
+
+    @property
+    def connected(self) -> bool:
+        """True when the client holds a live session."""
+        client = self._client
+        if client is None:
+            return False
+        is_connected = getattr(client, "is_connected", None)
+        if callable(is_connected):
+            try:
+                return bool(is_connected())
+            except Exception:
+                return False
+        return True
+
+    async def connect(self) -> Any:
+        """Return the logged-in client. Raise when the session is not logged in.
+
+        This path never prompts for a code. The setup command owns the
+        interactive login, so a daemon run with a dead session fails
+        fast with the setup hint instead of blocking on stdin.
+        """
+        if not self.enabled:
+            msg = "Telegram live is not enabled. Set telegram_live.enabled and its api credentials."
+            raise RuntimeError(msg)
+        if self._client is not None and self.connected:
+            return self._client
+        async with self._lock:
+            if self._client is not None and self.connected:
+                return self._client
+            if self._client is not None:
+                old, self._client = self._client, None
+                try:
+                    await old.disconnect()
+                except Exception:
+                    logger.warning("[telegram_live] Dead session disconnect failed", exc_info=True)
+            factory = self._client_factory
+            if factory is None:
+                from telethon import TelegramClient  # type: ignore[import-untyped]
+
+                factory = TelegramClient
+            live = self._config.telegram_live
+            client = factory(telegram_live_session_path(self._config), live.api_id, live.api_hash)
+            try:
+                await client.connect()
+                authorized = bool(await client.is_user_authorized())
+            except Exception as e:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    logger.warning("[telegram_live] Temp client disconnect failed", exc_info=True)
+                msg = f"Telegram live login failed: {e}. {SETUP_HINT}"
+                raise RuntimeError(msg) from e
+            if not authorized:
+                await client.disconnect()
+                msg = f"Telegram user session is not logged in. {SETUP_HINT}"
+                raise RuntimeError(msg)
+            self._client = client
+            logger.info("[telegram_live] Connected")
+            return client
+
+    async def disconnect(self) -> None:
+        """Close the session. Never raises: shutdown must finish."""
+        async with self._lock:
+            client, self._client = self._client, None
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    logger.warning("[telegram_live] Disconnect failed", exc_info=True)
+
+    async def ensure_destination(self, channel: str) -> int:
+        """Peer id of the Telegram channel for ``channel``.
+
+        A stored mapping wins. Without one, auto-create builds a private
+        channel, stores its peer id in the config at once, and returns
+        it. The store goes through ``apply_config_change``, so the peer
+        id lands on disk before the first stream starts.
+        """
+        peer = self._config.channel_telegram_peers.get(channel)
+        if peer:
+            return peer
+        if not self._config.telegram_live.auto_create_channels:
+            msg = (
+                f"No Telegram channel is mapped for {channel}. "
+                "Add it to channel_telegram_peers or turn on telegram_live.auto_create_channels."
+            )
+            raise RuntimeError(msg)
+        async with self._create_lock:
+            # A second start of the same channel can land here while the
+            # first one creates. Read the mapping again inside the lock.
+            peer = self._config.channel_telegram_peers.get(channel)
+            if peer:
+                return peer
+            client = await self.connect()
+            from telethon.tl.functions.channels import CreateChannelRequest  # type: ignore[import-untyped]
+
+            title = sanitize_metadata_text(f"{bare_name(channel)} restream", limit=128)
+            about = f"Live restream of {channel_url(channel)} by StreamArchive"
+            try:
+                result = await client(CreateChannelRequest(broadcast=True, title=title, about=about))
+            except Exception as e:
+                msg = f"Telegram channel create failed for {channel}: {e}"
+                raise RuntimeError(msg) from e
+            chat = _channel_from_result(result)
+            raw_id = getattr(chat, "id", None)
+            if not isinstance(raw_id, int):
+                msg = f"Telegram channel create for {channel} returned no channel id: {result!r}"
+                raise RuntimeError(msg)
+            peer = marked_peer_id(raw_id)
+
+            def store(cfg: AppConfig) -> None:
+                cfg.channel_telegram_peers[channel] = peer
+
+            apply_config_change(self._config, store)
+            logger.info("[telegram_live] Created Telegram channel %s for %s", peer, channel)
+            return peer
+
+    async def create_stream(self, author: str, title: str, channel: str, game: str) -> dict[str, Any]:
+        """Start a live stream for one monitored channel.
+
+        Returns the RTMP address, the call ids the end call needs, and a
+        member link. The title follows the YouTube form: author - title.
+        """
+        client = await self.connect()
+        peer_id = await self.ensure_destination(channel)
+        from telethon.tl.functions.phone import (  # type: ignore[import-untyped]
+            CreateGroupCallRequest,
+            GetGroupCallStreamRtmpUrlRequest,
+            ToggleGroupCallRecordRequest,
+        )
+        from telethon.tl.types import InputGroupCall  # type: ignore[import-untyped]
+
+        input_peer = await client.get_input_entity(peer_id)
+        rtmp = await client(GetGroupCallStreamRtmpUrlRequest(peer=input_peer, revoke=False))
+        url = getattr(rtmp, "url", None)
+        key = getattr(rtmp, "key", None)
+        if not isinstance(url, str) or not isinstance(key, str) or not url or not key:
+            msg = f"Telegram returned no RTMP address for {channel}: {rtmp!r}"
+            raise RuntimeError(msg)
+        live_title = sanitize_metadata_text(f"{author} - {title}", limit=200)
+        result = await client(
+            CreateGroupCallRequest(peer=input_peer, rtmp_stream=True, random_id=secrets.randbits(31), title=live_title)
+        )
+        call = _call_from_updates(result)
+        call_id = getattr(call, "id", None)
+        access_hash = getattr(call, "access_hash", None)
+        if not isinstance(call_id, int) or not isinstance(access_hash, int):
+            msg = f"Telegram live create for {channel} returned no call id: {result!r}"
+            raise RuntimeError(msg)
+        if self._config.telegram_live.record:
+            # Best effort: a recording failure must not kill the stream.
+            # The file lands in Saved Messages when the stream ends.
+            try:
+                await client(
+                    ToggleGroupCallRecordRequest(
+                        call=InputGroupCall(id=call_id, access_hash=access_hash),
+                        start=True,
+                        video=True,
+                        video_portrait=False,
+                    )
+                )
+            except Exception:
+                logger.warning("[telegram_live] Server recording start failed for %s", channel, exc_info=True)
+        raw_id = str(peer_id).removeprefix("-100")
+        logger.info("[telegram_live] Live started for %s on Telegram channel %s", channel, peer_id)
+        return {
+            "peer_id": peer_id,
+            "call_id": call_id,
+            "access_hash": access_hash,
+            "rtmp_url": join_rtmp_url(url, key),
+            "telegram_url": f"https://t.me/c/{raw_id}",
+        }
+
+    async def end_stream(self, telegram_info: dict[str, Any]) -> None:
+        """End one live stream. Raises on failure: the caller logs it."""
+        client = await self.connect()
+        from telethon.tl.functions.phone import DiscardGroupCallRequest
+        from telethon.tl.types import InputGroupCall
+
+        call = InputGroupCall(id=int(telegram_info["call_id"]), access_hash=int(telegram_info["access_hash"]))
+        await client(DiscardGroupCallRequest(call=call))
+        logger.info("[telegram_live] Live ended on Telegram channel %s", telegram_info.get("peer_id"))
+
+    async def close(self) -> None:
+        await self.disconnect()
