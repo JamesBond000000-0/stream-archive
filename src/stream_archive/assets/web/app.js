@@ -429,7 +429,7 @@ async function loadChannels() {
       modeCaption.textContent = "Output mode";
       modeField.appendChild(modeCaption);
       const modeSel = document.createElement("select");
-      for (const m of ["disk", "youtube", "both", "default"]) {
+      for (const m of ["disk", "youtube", "both", "telegram", "telegram_both", "default"]) {
         const o = document.createElement("option");
         o.value = m;
         o.textContent = m === "default" ? "global" : m;
@@ -469,14 +469,14 @@ async function loadChannels() {
           // control, falling back to the effective mode for "global".
           const liveMode = modeSel.value === "default" ? ch.output_mode : modeSel.value;
           let eff = v.toLowerCase();
-          if (eff === "default" && (liveMode === "youtube" || liveMode === "both")) {
+          if (eff === "default" && liveMode !== "disk") {
             // Clearing the override hands control to the global value,
             // which this card cannot see: read it before deciding.
             const s = await api("/api/v1/settings");
             eff = String(s.preferred_quality || "").toLowerCase();
           }
           let prevMode = null;
-          if (eff === "audio_only" && (liveMode === "youtube" || liveMode === "both")) {
+          if (eff === "audio_only" && liveMode !== "disk") {
             if (!window.confirm(audioDiskMessage([ch.channel]))) {
               loadChannels();
               return;
@@ -630,7 +630,7 @@ async function loadChannels() {
 
 const SETTING_DEFS = [
   { key: "output_mode", label: "Output mode", hint: "Where new recordings go", type: "select",
-    options: [["Disk", "disk"], ["YouTube", "youtube"], ["Both", "both"]] },
+    options: [["Disk", "disk"], ["YouTube", "youtube"], ["Both", "both"], ["Telegram", "telegram"], ["Telegram+Disk", "telegram_both"]] },
   { key: "preferred_quality", label: "Preferred quality", hint: "Audio-only records sound and forces disk output", type: "select",
     options: [["Best", "best"], ["1080p", "1080p"], ["720p", "720p"], ["480p", "480p"], ["360p", "360p"], ["Audio only", "audio_only"]] },
   { key: "retention_days", label: "Retention", hint: "Delete recordings older than this", type: "preset-number",
@@ -639,6 +639,8 @@ const SETTING_DEFS = [
     presets: [["Unlimited", 0], ["1", 1], ["2", 2], ["3", 3], ["5", 5]], unit: "" },
   { key: "max_concurrent_youtube_streams", label: "Max restreams", hint: "At the same time", type: "preset-number",
     presets: [["Unlimited", 0], ["1", 1], ["2", 2], ["3", 3], ["5", 5]], unit: "" },
+  { key: "max_concurrent_telegram_streams", label: "Max Telegram restreams", hint: "At the same time", type: "preset-number",
+    presets: [["Unlimited", 0], ["1", 1], ["2", 2], ["3", 3], ["5", 5]], unit: "" },
   { key: "record_chat", label: "Twitch chat", hint: "Save live chat with the video", type: "bool" },
   { key: "kick_record_chat", label: "Kick chat", hint: "Save live chat with the video", type: "bool" },
   { key: "disk_max_total_gb", label: "Disk cap", hint: "Archive size limit", type: "preset-number",
@@ -646,6 +648,9 @@ const SETTING_DEFS = [
   { key: "disk_delete_oldest", label: "Delete oldest when full", hint: "Otherwise new recordings stop", type: "bool" },
   { key: "youtube_hold_seconds", label: "YouTube hold", hint: "Delay before ending the restream", type: "preset-number",
     presets: [["Off", 0], ["30 s", 30], ["60 s", 60], ["120 s", 120], ["300 s", 300], ["600 s", 600]], unit: "s" },
+  { key: "youtube_max_broadcast_hours", label: "Split long restreams", hint: "New broadcast after this many hours, with no gap", type: "preset-number",
+    presets: [["Off", 0], ["6 h", 6], ["8 h", 8], ["10 h", 10], ["11 h", 11], ["11 h 50 m", 11.8333]],
+    step: 0.0166667, unit: "h" },
   { key: "endpoint_enabled", label: "Panel access", hint: "Reach the panel beyond this machine", type: "bool" },
   { key: "endpoint_public_url", label: "Panel URL", hint: "Public address of your own proxy", type: "text",
     placeholder: "https://example.com" },
@@ -718,6 +723,7 @@ function settingControl(def, current) {  const lab = document.createElement("lab
     const num = document.createElement("input");
     num.type = "number";
     num.min = "0";
+    if (def.step) num.step = String(def.step);
     num.id = "set-" + def.key;
     const match = String(current);
     if (def.presets.some(([, v]) => String(v) === match)) {
@@ -736,8 +742,13 @@ function settingControl(def, current) {  const lab = document.createElement("lab
     get = () => {
       if (sel.value !== "custom") return Number(sel.value);
       const n = Number(num.value);
-      if (num.value.trim() === "" || !Number.isInteger(n) || n < 0) {
-        throw new Error(def.label + " needs a whole number of 0 or more");
+      // A plain preset list holds whole numbers. A step list (the split
+      // length) also takes a fraction of a unit, such as 11 h 50 m.
+      const whole = Number.isInteger(n);
+      if (num.value.trim() === "" || !Number.isFinite(n) || n < 0 || (!def.step && !whole)) {
+        throw new Error(
+          def.label + (def.step ? " needs a number of 0 or more" : " needs a whole number of 0 or more"),
+        );
       }
       return n;
     };
@@ -763,11 +774,13 @@ async function loadSettings() {
       retention_days: s.retention_days,
       max_concurrent_recordings: s.max_concurrent_recordings,
       max_concurrent_youtube_streams: s.max_concurrent_youtube_streams,
+      max_concurrent_telegram_streams: s.max_concurrent_telegram_streams,
       record_chat: s.record_chat,
       kick_record_chat: s.kick_record_chat,
       disk_max_total_gb: s.disk.max_total_gb,
       disk_delete_oldest: s.disk.delete_oldest,
       youtube_hold_seconds: s.youtube.hold_seconds,
+      youtube_max_broadcast_hours: s.youtube.max_broadcast_hours,
       endpoint_enabled: s.endpoint.enabled,
       endpoint_public_url: s.endpoint.public_url,
       kick_webhook_enabled: s.kick_webhook.enabled,
@@ -1950,7 +1963,7 @@ document.addEventListener("DOMContentLoaded", () => {
         .filter((c) => {
           const q = String(c.quality_override || payload.preferred_quality || "").toLowerCase();
           const m = String(c.output_mode_override || payload.output_mode || "").toLowerCase();
-          return q === "audio_only" && (m === "youtube" || m === "both");
+          return q === "audio_only" && m !== "disk";
         })
         .map((c) => c.channel);
       if (conflicts.length) {

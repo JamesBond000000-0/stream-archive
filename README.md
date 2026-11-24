@@ -45,6 +45,7 @@ Two blocks need extra steps:
 - **Chat recording.** Twitch IRC chat and Kick webhook chat land in TwitchDownloader-compatible JSON. See [Chat recording](docs/chat-recording.md).
 - **Retention and disk cap.** Old files expire after `retention_days`. An optional `disk.max_total_gb` cap deletes the oldest files or stops new recordings.
 - **Self-healing.** Dead recordings restart on the next poll cycle. YouTube restreams restart with growing delays inside a daily broadcast budget. Quota errors fall back to disk.
+- **Long restreams.** `youtube.max_broadcast_hours` splits a day-long restream into a chain of broadcasts under the 12-hour archive limit. The next broadcast starts before the old one ends, so the live feed has no gap and the disk file stays whole.
 - **Telegram alerts.** Live and offline alerts carry the stream facts and the file facts. Failure alerts arrive at most once per 30 minutes for each channel.
 - **Telegram bot.** The admin manages channels, modes, quality, chat, limits, remote access, and uploads over the Telegram bot. See [Telegram control](docs/telegram-control.md).
 - **Web panel.** The browser replaces the Telegram bot: status, channels, settings, recordings with a player, reload, restart, and update. See [Web panel](docs/web-control.md).

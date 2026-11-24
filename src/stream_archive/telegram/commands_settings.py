@@ -9,7 +9,9 @@ from stream_archive.config import (
     AppConfig,
     OutputMode,
     effective_quality,
+    format_hours,
     is_kick_channel,
+    parse_hours,
     reload_config,
 )
 from stream_archive.telegram.menu_state import AudioSwitch, PendingKey, is_error
@@ -19,7 +21,13 @@ logger = logging.getLogger(__name__)
 #: Button labels for the settings menus. Each table maps a label to its config
 #: value. The keyboards mark the label of the current value, the handlers turn
 #: a pressed label back into the config value.
-MODE_CHOICES: dict[str, str] = {"Disk": "disk", "YouTube": "youtube", "Both": "both"}
+MODE_CHOICES: dict[str, str] = {
+    "Disk": "disk",
+    "YouTube": "youtube",
+    "Both": "both",
+    "Telegram": "telegram",
+    "Telegram+Disk": "telegram_both",
+}
 QUALITY_CHOICES: dict[str, str] = {
     "Best": "best",
     "1080p": "1080p",
@@ -127,7 +135,10 @@ class SettingsCommands:
 
             return cast(str, self._apply(mutate, lambda c: f"Output mode for {ch} set to {m}", chat_id))
 
-        return "Usage: /mode <disk|youtube|both> or /mode <channel> <disk|youtube|both|default>"
+        return (
+            "Usage: /mode <disk|youtube|both|telegram|telegram_both> "
+            "or /mode <channel> <disk|youtube|both|telegram|telegram_both|default>"
+        )
 
     def handle_global_hold(self, args: list[str], chat_id: int | None = None) -> str:
         """Set the global YouTube hold delay. The control API also calls this."""
@@ -144,6 +155,24 @@ class SettingsCommands:
             candidate.youtube.hold_seconds = n
 
         return cast(str, self._apply(mutate, lambda c: f"Hold delay set to {n}s (0 = end immediately)", chat_id))
+
+    def handle_split_hours(self, args: list[str], chat_id: int | None = None) -> str:
+        """Set the YouTube split length. The control API also calls this."""
+        err = "\u274c split length must be hours >= 0: 11, 11.5, 11:50, or 11h50m (0 = one broadcast)"
+        if len(args) != 1:
+            return "Usage: /split <hours> (11, 11.5, 11:50, or 11h50m)"
+        hours = parse_hours(args[0])
+        if hours is None or not math.isfinite(hours) or hours < 0:
+            return err
+
+        def mutate(candidate: AppConfig) -> None:
+            candidate.youtube.max_broadcast_hours = hours
+
+        summary = (
+            f"Split length set to {format_hours(hours)} "
+            f"(0 = one broadcast; keep it under 12h so YouTube keeps the replay)"
+        )
+        return cast(str, self._apply(mutate, lambda c: summary, chat_id))
 
     def handle_channel_hold(self, args: list[str], chat_id: int | None = None) -> str:
         if len(args) != 2:
@@ -437,6 +466,15 @@ class SettingsCommands:
             "max_concurrent_youtube_streams",
             "Max YouTube re-streams",
             "Usage: /maxyoutube <n> (0 = unlimited)",
+            args,
+            chat_id,
+        )
+
+    def handle_maxtelegram(self, args: list[str], chat_id: int | None = None) -> str:
+        return self._set_count(
+            "max_concurrent_telegram_streams",
+            "Max Telegram re-streams",
+            "Usage: /maxtelegram <n> (0 = unlimited)",
             args,
             chat_id,
         )

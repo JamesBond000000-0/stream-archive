@@ -6,6 +6,7 @@ import logging
 import os
 import time
 from collections.abc import Callable, Coroutine
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -17,7 +18,7 @@ from stream_archive.config import (
     channel_url,
 )
 from stream_archive.health import clear_degraded, set_degraded
-from stream_archive.recorder.common import sanitize_filename, sanitize_metadata_text
+from stream_archive.recorder.common import RECORDED_BY_MARKER, sanitize_filename, sanitize_metadata_text
 from stream_archive.recorder.types import HoldState, Recording
 
 if TYPE_CHECKING:
@@ -34,8 +35,9 @@ _BACKOFF_BASE_S = 120
 _BACKOFF_MAX_S = 1800
 
 # Rolling 24-hour budget of broadcast creations. Guards YouTube's daily
-# limit on new broadcast creations.
-_YOUTUBE_DAILY_BUDGET = 10
+# limit on new broadcast creations. A split chain spends one create for
+# each part, so the budget covers about two full days of 11-hour parts.
+_YOUTUBE_DAILY_BUDGET = 30
 
 _YOUTUBE_BUDGET_WINDOW_S = 86400
 
@@ -50,6 +52,18 @@ _RECONNECT_CLIP = Path(__file__).resolve().parent.parent / "assets" / "reconnect
 #: shared daily pool for the calls that matter (broadcast creates). The
 #: alert goes to a human, so minute-scale latency costs nothing.
 _STATUS_POLL_S = 120.0
+
+#: Delay between orphan sweeps, in seconds. One sweep costs one
+#: ``liveBroadcasts.list`` unit plus one ``liveStreams.list`` unit per
+#: candidate, so ten minutes keeps the cost near zero.
+_ORPHAN_SWEEP_INTERVAL_S = 600.0
+
+#: How long the old broadcast keeps receiving the feed after the next one
+#: starts. Both ingests hold the live feed in this window, so the new link
+#: is already playing before the old one ends, and the old viewers see no
+#: gap. YouTube wants a few seconds of ingest before it flips the new
+#: broadcast to live, hence the margin.
+_HANDOVER_OVERLAP_S = 20.0
 
 #: Substrings that mark an ffmpeg stderr line as an output failure. The
 #: caller consults them only when the capture already failed (broken pipe
@@ -101,6 +115,7 @@ class YoutubeOutputMixin:
     _notifier: Notifier | None
     _recordings: dict[str, Recording]
     _held: dict[str, HoldState]
+    _orphan_first_seen: dict[str, float]
     _quick_ends: dict[str, int]
     _backoff_until: dict[str, float]
     _youtube_starts: list[float]
@@ -110,9 +125,8 @@ class YoutubeOutputMixin:
     # a signature drift fails type checks instead of failing at runtime.
     _track: Callable[[str, Coroutine[Any, Any, Any]], asyncio.Task[Any]]
     _record_disk: Callable[[str, str, Any], Coroutine[Any, Any, None]]
-    _pipe_stream: Callable[
-        [str, Any, Any, str | None, asyncio.Event | None], Coroutine[Any, Any, tuple[bool, str | None, bool]]
-    ]
+    _open_feed: Callable[[Any], Coroutine[Any, Any, Any]]
+    _spawn_bg: Callable[[Coroutine[Any, Any, Any]], asyncio.Task[Any]]
     _read_ffmpeg_stderr: Callable[[str, Any], Coroutine[Any, Any, list[str]]]
     _channel_dir: Callable[[str], str]
 
@@ -376,14 +390,7 @@ class YoutubeOutputMixin:
             logger.info("[recorder] [youtube] %s reusing held broadcast %s", channel, youtube_info["broadcast_id"])
         else:
             try:
-                youtube = self._require_streamer(channel)
-                # Hold the lock across the check, the create and the record.
-                # Concurrent starts otherwise all pass the check before any
-                # of them records its slot, and the daily budget overflows.
-                async with self._youtube_budget_lock:
-                    self._require_budget_slot()
-                    youtube_info = await youtube.create_stream(author, title, channel, game)
-                    self._youtube_starts.append(time.time())  # count fresh creates only
+                youtube_info = await self._create_broadcast(channel, author, title, game)
             except Exception as e:
                 logger.error("[recorder] [youtube] Failed to create YouTube stream: %s", e)
                 if "stream-archive-setup-youtube" in str(e):
@@ -442,6 +449,7 @@ class YoutubeOutputMixin:
                 await self._end_broadcast(channel, youtube_info["broadcast_id"])
                 return
             entry["youtube_info"] = youtube_info
+        entry["part_started_at"] = time.monotonic()
 
         if self._notifier and youtube_notify:
             try:
@@ -450,17 +458,305 @@ class YoutubeOutputMixin:
                 )
             except Exception:
                 logger.error("[recorder] live notification failed for %s", channel, exc_info=True)
-        # A takedown revokes the broadcast but leaves the ingest open, so
-        # ffmpeg never errors. Poll the broadcast status beside the pipe.
-        # The task starts after the spawn below, so a spawn failure leaks
-        # nothing: see below.
-        # On revoked the watcher alerts once, marks the broadcast abandoned,
-        # and returns; the pipe then drops the ingest and, in ``both`` mode,
-        # keeps writing the disk file alone. The recording ends normally, so
-        # the monitor does not restart a restream of flagged content.
-        status_stop = asyncio.Event()
-        youtube_abandoned = asyncio.Event()
-        rtmp_url = youtube_info["rtmp_url"]
+        await self._capture_and_restream(channel, author, title, game, stream, filepath)
+
+    async def _create_broadcast(self, channel: str, author: str, title: str, game: str) -> dict[str, Any]:
+        """Create one broadcast and record its budget slot.
+
+        The lock covers the budget check, the create, and the record, so
+        concurrent starts cannot all pass the check before any of them
+        records its slot.
+        """
+        youtube = self._require_streamer(channel)
+        async with self._youtube_budget_lock:
+            self._require_budget_slot()
+            youtube_info: dict[str, Any] = await youtube.create_stream(author, title, channel, game)
+            self._youtube_starts.append(time.time())  # count fresh creates only
+        return youtube_info
+
+    def _part_seconds(self) -> float:
+        """Length of one broadcast of a split restream, in seconds.
+
+        ``0`` keeps one broadcast for the whole stream. The value comes
+        from the live config, so a reload applies at the next boundary.
+        """
+        hours = self._config.youtube.max_broadcast_hours
+        return hours * 3600.0 if hours > 0 else 0.0
+
+    async def _capture_and_restream(
+        self,
+        channel: str,
+        author: str,
+        title: str,
+        game: str,
+        stream: Any,
+        filepath: str | None,
+    ) -> None:
+        """Read the source once, and split the broadcast when the part ends.
+
+        The read loop copies the source into the disk file and into the
+        stdin of the current ffmpeg. At a split boundary the next broadcast
+        is created and its ffmpeg joins the live feed. Both ingests then
+        receive every chunk for a short overlap, and the old broadcast ends
+        after that. The source is never re-opened, so the disk file has no
+        gap, and the new link is live before the old one ends.
+        """
+        try:
+            fd = await self._open_feed(stream)
+        except Exception as e:
+            logger.error("[recorder] [youtube] %s stream open failed: %s", channel, e)
+            msg = f"[youtube] {channel} stream interrupted"
+            raise RuntimeError(msg) from e
+
+        abandoned = asyncio.Event()
+        stop = asyncio.Event()
+        # Live feeders of the current broadcast. A handover adds one and the
+        # overlap task drops the old one.
+        feeders: list[Any] = []
+        # One stderr drain for each feeder, paired with the feeder it reads.
+        stderr_drains: list[tuple[Any, asyncio.Task[Any]]] = []
+        status_task: asyncio.Task[Any] | None = None
+        file_handle: Any = None
+        youtube_error: str | None = None
+        clean = False
+        stderr_lines: list[str] = []
+        last_proc: Any = None
+        exit_codes: dict[int, int | None] = {}
+        loop = asyncio.get_running_loop()
+        try:
+            if filepath:
+                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                file_handle = open(filepath, "wb")  # noqa: SIM115 - closed in the finally below
+            entry = self._recordings.get(channel)
+            if entry is None:
+                return
+            first = await self._spawn_feeder(channel, entry.get("youtube_info"))
+            if first is None:
+                return
+            feeders.append(first)
+            stderr_drains.append((first, asyncio.create_task(self._read_ffmpeg_stderr(channel, first))))
+            status_task = asyncio.create_task(
+                self._watch_broadcast_status(channel, title, filepath is not None, abandoned, stop)
+            )
+            clean, youtube_error = await self._feed(
+                channel, author, title, game, fd, file_handle, feeders, stderr_drains, abandoned
+            )
+        finally:
+            stop.set()
+            if status_task is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await asyncio.gather(status_task, return_exceptions=True)
+            # Snapshot the exit code first: our own terminate would replace a
+            # running feeder's None with a signal code and fake a failure.
+            exit_codes = {id(proc): getattr(proc, "returncode", None) for proc in feeders}
+            for proc in list(feeders):
+                await self._terminate(proc)
+            for index, (proc, task) in enumerate(stderr_drains):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    result = (await asyncio.gather(task, return_exceptions=True))[0]
+                    # The last feeder is the current part: its stderr names
+                    # the cause when ffmpeg died.
+                    if index == len(stderr_drains) - 1:
+                        last_proc = proc
+                        if isinstance(result, list):
+                            stderr_lines = result
+            if file_handle is not None:
+                with contextlib.suppress(Exception):
+                    await loop.run_in_executor(None, file_handle.close)
+            with contextlib.suppress(Exception):
+                await loop.run_in_executor(None, fd.close)
+            logger.info("[recorder] [youtube] %s ffmpeg stopped", channel)
+
+        reason = youtube_output_hint(exit_codes.get(id(last_proc)), clean, stderr_lines)
+        if youtube_error is not None or reason is not None:
+            entry = self._recordings.get(channel) or {}
+            await self._notify_youtube_failure(
+                channel,
+                entry.get("youtube_info") or {},
+                title,
+                youtube_error or reason or "the ffmpeg ingest stopped",
+                filepath is not None,
+            )
+            if not clean:
+                msg = f"[youtube] {channel} stream interrupted"
+                raise RuntimeError(msg)
+            return
+        if abandoned.is_set():
+            # The takedown alert already went out. End normally: the disk
+            # file finalizes, and the monitor does not restart a restream
+            # of flagged content.
+            logger.info("[recorder] [youtube] %s stopped feeding the revoked broadcast", channel)
+            return
+        if not clean:
+            msg = f"[youtube] {channel} stream interrupted"
+            raise RuntimeError(msg)
+
+    async def _feed(
+        self,
+        channel: str,
+        author: str,
+        title: str,
+        game: str,
+        fd: Any,
+        file_handle: Any,
+        feeders: list[Any],
+        stderr_drains: list[tuple[Any, asyncio.Task[Any]]],
+        abandoned: asyncio.Event,
+    ) -> tuple[bool, str | None]:
+        """Copy the source into the disk file and the live ingest pipes.
+
+        Return ``(clean, youtube_error)``. ``clean`` is True only when the
+        source reached EOF. A broken ingest drops that feeder: with a disk
+        file the copy goes on to the end, and ``youtube_error`` names the
+        failure. A source read failure returns ``(False, None)`` and keeps
+        every byte written so far.
+        """
+        loop = asyncio.get_running_loop()
+        ingest_error: str | None = None
+        entry = self._recordings.get(channel)
+        part_end = self._part_end(entry)
+        # The task that builds the next part. A boundary waits for it, so
+        # one split cannot start a create on every loop pass.
+        split_task: asyncio.Task[Any] | None = None
+        while True:
+            if abandoned.is_set() and feeders:
+                for proc in list(feeders):
+                    self._close_stdin(proc)
+                feeders.clear()
+            if split_task is not None and split_task.done():
+                split_task = None
+                entry = self._recordings.get(channel) or entry
+                part_end = self._part_end(entry)
+            if part_end is not None and split_task is None and time.monotonic() >= part_end and not abandoned.is_set():
+                split_task = self._spawn_bg(self._start_next_part(channel, author, title, game, feeders, stderr_drains))
+            try:
+                data = await loop.run_in_executor(None, fd.read, 65536)
+            except Exception as e:
+                logger.error("[recorder] [youtube] %s read error: %s", channel, e)
+                return (False, ingest_error)
+            if not data:
+                return (True, ingest_error)
+            if file_handle is not None:
+                # The archive volume can be slow. Write on the executor.
+                await loop.run_in_executor(None, file_handle.write, data)
+            broken: list[Any] = []
+            for proc in feeders:
+                stdin = getattr(proc, "stdin", None)
+                if stdin is None:
+                    broken.append(proc)
+                    continue
+                try:
+                    stdin.write(data)
+                    await stdin.drain()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
+                    ingest_error = f"YouTube ingest failed: {e}"
+                    broken.append(proc)
+                    logger.warning("[recorder] [youtube] %s %s", channel, ingest_error)
+                except Exception as e:
+                    ingest_error = f"YouTube ingest failed: {e}"
+                    broken.append(proc)
+                    logger.error("[recorder] [youtube] %s %s", channel, ingest_error)
+            for proc in broken:
+                if proc in feeders:
+                    feeders.remove(proc)
+                self._close_stdin(proc)
+            if not feeders and file_handle is None:
+                return (False, ingest_error or "ffmpeg is not running")
+
+    def _part_end(self, entry: Any) -> float | None:
+        """Monotonic time of the next split boundary, or None when off."""
+        part = self._part_seconds()
+        if part <= 0 or entry is None:
+            return None
+        started = entry.get("part_started_at") or entry.get("started_at")
+        if started is None:
+            return None
+        return float(started) + part
+
+    async def _start_next_part(
+        self,
+        channel: str,
+        author: str,
+        title: str,
+        game: str,
+        feeders: list[Any],
+        stderr_drains: list[tuple[Any, asyncio.Task[Any]]],
+    ) -> Any:
+        """Create the next broadcast and add its feeder to the live feed.
+
+        Return the new process, or None when the split did not happen. A
+        failed create leaves the current broadcast running: the next
+        boundary tries again.
+        """
+        entry = self._recordings.get(channel)
+        if entry is None:
+            return None
+        old_info = entry.get("youtube_info") or {}
+        try:
+            new_info = await self._create_broadcast(channel, author, title, game)
+            proc = await self._spawn_feeder(channel, new_info)
+        except Exception as e:
+            logger.error("[recorder] [youtube] %s split failed, keeping the broadcast: %s", channel, e)
+            return None
+        if proc is None:
+            logger.error("[recorder] [youtube] %s split could not start ffmpeg", channel)
+            with contextlib.suppress(Exception):
+                await self._end_broadcast(channel, new_info["broadcast_id"])
+            return None
+        entry["youtube_info"] = new_info
+        entry["part_started_at"] = time.monotonic()
+        feeders.append(proc)
+        stderr_drains.append((proc, asyncio.create_task(self._read_ffmpeg_stderr(channel, proc))))
+        logger.info(
+            "[recorder] [youtube] %s next part started on %s (overlap %.0fs)",
+            channel,
+            new_info["youtube_url"],
+            _HANDOVER_OVERLAP_S,
+        )
+        # The feeders before the new one are the parts that just ended. The
+        # overlap task drops them after the window.
+        old_procs = [p for p in feeders if p is not proc]
+        for proc in old_procs:
+            feeders.remove(proc)
+        self._spawn_bg(self._schedule_part_end(channel, old_info.get("broadcast_id"), old_procs))
+        if self._notifier:
+            try:
+                await self._notifier.notify(
+                    f"\U0001f500 {channel}: long restream split into a new broadcast.\n"
+                    f"New YouTube link: {new_info['youtube_url']}\n"
+                    f"The previous link ends in {_HANDOVER_OVERLAP_S:.0f}s. "
+                    "The recording continues without a gap."
+                )
+            except Exception:
+                logger.error("[recorder] split notification failed for %s", channel, exc_info=True)
+        return proc
+
+    async def _schedule_part_end(self, channel: str, old_broadcast_id: str | None, old_procs: list[Any]) -> None:
+        """End the old broadcast and its feeders after the overlap.
+
+        The wait runs as a task, so the feed loop keeps copying to the new
+        ingest at once. A failed end is logged and never reaches the loop.
+        """
+        await asyncio.sleep(_HANDOVER_OVERLAP_S)
+        for proc in old_procs:
+            await self._terminate(proc)
+        if old_broadcast_id:
+            await self._end_broadcast(channel, old_broadcast_id)
+        logger.info("[recorder] [youtube] %s previous part ended (%s)", channel, old_broadcast_id)
+
+    @staticmethod
+    def _close_stdin(proc: Any) -> None:
+        """Close one feeder's stdin, so its ffmpeg sees EOF and exits."""
+        stdin = getattr(proc, "stdin", None)
+        if stdin is not None:
+            with suppress(Exception):
+                stdin.close()
+
+    async def _spawn_feeder(self, channel: str, youtube_info: dict[str, Any] | None) -> Any:
+        """Start the ffmpeg that feeds one ingest. None when ffmpeg is missing."""
+        rtmp_url = (youtube_info or {}).get("rtmp_url")
+        if not rtmp_url:
+            return None
         ffmpeg_cmd = [
             "ffmpeg",
             "-loglevel",
@@ -485,66 +781,12 @@ class YoutubeOutputMixin:
             rtmp_url,
         ]
         logger.info("[recorder] [youtube] Starting ffmpeg for %s", channel)
-
-        process = await asyncio.create_subprocess_exec(
+        return await asyncio.create_subprocess_exec(
             *ffmpeg_cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        # Created after the spawn: a spawn failure must not orphan the
-        # 120s poll loop holding the streamer reference.
-        status_task = asyncio.create_task(
-            self._watch_broadcast_status(
-                channel, youtube_info, title, filepath is not None, youtube_abandoned, status_stop
-            )
-        )
-        pipe_task = asyncio.create_task(self._pipe_stream(channel, stream, process, filepath, youtube_abandoned))
-        stderr_task = asyncio.create_task(self._read_ffmpeg_stderr(channel, process))
-
-        try:
-            results = await asyncio.gather(pipe_task, stderr_task)
-        except asyncio.CancelledError:
-            # Every reader holds a pipe or a poll, so all of them must stop
-            # and be awaited here. A task left pending masks the ffmpeg
-            # stderr and warns "Task was destroyed but it is pending" at
-            # shutdown.
-            for task in (pipe_task, stderr_task, status_task):
-                task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await asyncio.gather(pipe_task, stderr_task, status_task, return_exceptions=True)
-            logger.info("[recorder] [youtube] %s cancelled", channel)
-            raise
-        finally:
-            # The watcher stops on every path, not just success: a gather
-            # failure must not orphan its poll loop either. Awaiting a
-            # finished task returns at once, so the cancel path above pays
-            # nothing extra here.
-            status_stop.set()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await asyncio.gather(status_task, return_exceptions=True)
-            await self._terminate(process)
-            logger.info("[recorder] [youtube] %s ffmpeg stopped (rc=%s)", channel, process.returncode)
-
-        pipe_clean, pipe_youtube_error, pipe_abandoned = results[0]
-        stderr_lines: list[str] = results[1]
-        if pipe_youtube_error is not None:
-            await self._notify_youtube_failure(channel, youtube_info, title, pipe_youtube_error, filepath is not None)
-            msg = f"[youtube] {channel} stream interrupted"
-            raise RuntimeError(msg)
-        if pipe_abandoned or youtube_abandoned.is_set():
-            # The takedown alert already went out. End normally: the disk
-            # file finalizes, and the monitor does not restart a restream
-            # of flagged content.
-            logger.info("[recorder] [youtube] %s stopped feeding the revoked broadcast", channel)
-            return
-        reason = youtube_output_hint(process.returncode, pipe_clean, stderr_lines)
-        if reason is not None:
-            await self._notify_youtube_failure(channel, youtube_info, title, reason, filepath is not None)
-
-        if not pipe_clean:
-            msg = f"[youtube] {channel} stream interrupted"
-            raise RuntimeError(msg)
 
     async def _notify_youtube_failure(
         self, channel: str, youtube_info: dict[str, Any], title: str | None, reason: str, has_disk: bool
@@ -581,7 +823,6 @@ class YoutubeOutputMixin:
     async def _watch_broadcast_status(
         self,
         channel: str,
-        youtube_info: dict[str, Any],
         title: str | None,
         has_disk: bool,
         abandoned: asyncio.Event,
@@ -592,16 +833,19 @@ class YoutubeOutputMixin:
         A takedown flips ``lifeCycleStatus`` to ``revoked`` while the RTMP
         ingest stays open, so the pipe and ffmpeg both look healthy. This
         poll catches that state and marks the broadcast abandoned, so the
-        pipe drops the ingest: in ``both`` mode the disk file carries on
+        feed drops the ingest: in ``both`` mode the disk file carries on
         alone, and the recording ends normally instead of restarting a
         restream of flagged content. Other states need no alert: ``live``
         is normal, and a missing broadcast is logged at debug level until
         the capture ends.
+
+        The broadcast id is read from the entry on every tick: a split
+        replaces it, and the old id answers ``complete`` once it ends.
         """
         streamer = self._youtube
-        broadcast_id = (youtube_info or {}).get("broadcast_id")
-        if streamer is None or not broadcast_id:
+        if streamer is None:
             return
+        watched: str | None = None
         try:
             while not stop.is_set():
                 try:
@@ -610,6 +854,16 @@ class YoutubeOutputMixin:
                     pass
                 else:
                     return
+                entry = self._recordings.get(channel)
+                youtube_info = (entry or {}).get("youtube_info") or {}
+                broadcast_id = youtube_info.get("broadcast_id")
+                if not broadcast_id:
+                    continue
+                if broadcast_id != watched:
+                    # A new part: its first poll happens on the next tick, so
+                    # a fresh broadcast has time to reach ``live``.
+                    watched = broadcast_id
+                    continue
                 try:
                     status = await streamer.get_broadcast_status(broadcast_id)
                 except asyncio.CancelledError:
@@ -625,6 +879,96 @@ class YoutubeOutputMixin:
             raise
         except Exception:
             logger.error("[recorder] broadcast watch failed for %s", channel, exc_info=True)
+
+    def _known_broadcast_ids(self) -> set[str]:
+        """Broadcast ids that a recording or a hold still owns.
+
+        A split moves the entry to the new id at once, and a hold keeps
+        its id here until it ends or a new stream takes it over. Any
+        other active broadcast is not ours to keep alive.
+        """
+        known: set[str] = set()
+        for entry in self._recordings.values():
+            info = entry.get("youtube_info") or {}
+            if info.get("broadcast_id"):
+                known.add(info["broadcast_id"])
+        for hold in self._held.values():
+            info = hold.get("youtube_info") or {}
+            if info.get("broadcast_id"):
+                known.add(info["broadcast_id"])
+        return known
+
+    async def cleanup_orphan_broadcasts(self) -> int:
+        """End broadcasts that a crash or a failed end call left live.
+
+        A broadcast is a candidate when all of these hold: this app made
+        it (the description marker), no recording or hold owns it, and
+        its ingest has no data. The sweep ends a candidate only after it
+        stays a candidate for ``orphan_cleanup_hours``, so a broadcast
+        in setup or in a short gap is safe. The marker guards streams
+        from other tools. The wait guards the rest: a held broadcast is
+        owned, and its keep-alive feed reads as active in any case.
+        Return the count ended. Never raises.
+        """
+        streamer = self._youtube
+        hours = self._config.youtube.orphan_cleanup_hours
+        if streamer is None or hours <= 0:
+            return 0
+        try:
+            broadcasts = await streamer.list_active_broadcasts()
+        except Exception:
+            logger.error("[recorder] [youtube] orphan sweep list failed", exc_info=True)
+            return 0
+        known = self._known_broadcast_ids()
+        now = time.monotonic()
+        cutoff = hours * 3600
+        seen_now: set[str] = set()
+        ended = 0
+        for item in broadcasts:
+            try:
+                broadcast_id = item.get("id")
+                if not isinstance(broadcast_id, str) or broadcast_id in known:
+                    continue
+                snippet = item.get("snippet") or {}
+                if RECORDED_BY_MARKER not in str(snippet.get("description") or ""):
+                    continue
+                details = item.get("contentDetails") or {}
+                stream_id = details.get("boundStreamId")
+                if not isinstance(stream_id, str) or not stream_id:
+                    continue
+                stream_status, health = await streamer.get_stream_health(stream_id)
+                if stream_status != "inactive" or health != "noData":
+                    continue
+                seen_now.add(broadcast_id)
+                first_seen = self._orphan_first_seen.setdefault(broadcast_id, now)
+                if now - first_seen < cutoff:
+                    continue
+                await streamer.end_stream(broadcast_id)
+                ended += 1
+                logger.info(
+                    "[recorder] [youtube] ended orphan broadcast %s (no owner, no data for over %.0f h)",
+                    broadcast_id,
+                    hours,
+                )
+                if self._notifier:
+                    with contextlib.suppress(Exception):
+                        await self._notifier.notify(
+                            f"\U0001f9f9 Ended an orphaned YouTube broadcast: https://www.youtube.com/watch?v={broadcast_id}\n"
+                            "It had no recording and no data on its ingest."
+                        )
+            except Exception:
+                logger.error("[recorder] [youtube] orphan sweep failed for one broadcast", exc_info=True)
+        # Forget candidates that left the list or found an owner, so a
+        # later orphan with a long life does not inherit an old clock.
+        self._orphan_first_seen = {bid: ts for bid, ts in self._orphan_first_seen.items() if bid in seen_now}
+        return ended
+
+    async def run_orphan_cleanup_loop(self) -> None:
+        """Run the orphan sweep on its interval until the task is cancelled."""
+        while True:
+            await asyncio.sleep(_ORPHAN_SWEEP_INTERVAL_S)
+            with contextlib.suppress(Exception):
+                await self.cleanup_orphan_broadcasts()
 
     async def _notify_youtube_takedown(
         self, channel: str, youtube_info: dict[str, Any], title: str | None, has_disk: bool

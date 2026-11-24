@@ -124,6 +124,20 @@ class TwitchAPI:
             raise
         return resolved
 
+    async def get_profile_image(self, username: str) -> str | None:
+        """Profile image URL of one user, or None when the user is unknown.
+
+        The users endpoint answers profile_image_url in the same
+        payload resolve_user_ids reads, so this costs one call.
+        """
+        resp = await self._request("GET", "https://api.twitch.tv/helix/users", params={"login": [username]})
+        resp.raise_for_status()
+        data = resp.json().get("data") or []
+        if not data:
+            return None
+        url = data[0].get("profile_image_url")
+        return url if isinstance(url, str) and url else None
+
     async def get_live_streams(self, user_ids: dict[str, str]) -> dict[str, Any]:
         if not user_ids:
             return {}

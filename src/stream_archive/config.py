@@ -2,6 +2,7 @@ import contextlib
 import copy
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -43,7 +44,16 @@ KICK_PREFIX = "kick:"
 TWITCH_PREFIX = "twitch:"
 AUDIO_ONLY_QUALITY = "audio_only"
 
-OutputMode = Literal["disk", "youtube", "both"]
+OutputMode = Literal["disk", "youtube", "both", "telegram", "telegram_both"]
+
+#: Output modes that send the capture to a YouTube restream.
+YOUTUBE_MODES = ("youtube", "both")
+
+#: Output modes that send the capture to a Telegram live stream.
+TELEGRAM_MODES = ("telegram", "telegram_both")
+
+#: Output modes that also write the capture to a disk file.
+DISK_MODES = ("disk", "both", "telegram_both")
 
 #: Config keys that moved from kick.webhook to the endpoint section.
 _LEGACY_ENDPOINT_KEYS = (
@@ -76,6 +86,70 @@ def telegram_enabled(config: AppConfig) -> bool:
     controls the app, and both can run at once when all values exist.
     """
     return config.telegram_user_id > 0 and bool(config.bot_telegram_api.strip())
+
+
+def parse_hours(text: str) -> float | None:
+    """Hours from text like ``11``, ``11.5``, ``11:50``, or ``11h50m``.
+
+    A colon form and an ``h``/``m`` form both read as hours and minutes, so
+    a split length near the 12-hour archive limit is easy to type. ``None``
+    means the text is not a value. A negative value is returned as it is:
+    the caller rejects it with its own message.
+    """
+    raw = text.strip().lower().replace(" ", "")
+    if not raw:
+        return None
+    if raw.endswith("m") and "h" not in raw:
+        try:
+            minutes = float(raw[:-1])
+        except ValueError:
+            return None
+        if not math.isfinite(minutes) or minutes < 0 or minutes >= 60:
+            return None
+        return minutes / 60
+    if raw.endswith("h") or raw.endswith("m"):
+        hours_text, _, rest = raw.partition("h")
+        minutes_text = rest[:-1] if rest.endswith("m") else rest
+        if not hours_text:
+            hours_text = "0"
+        try:
+            hours = float(hours_text)
+            minutes = float(minutes_text) if minutes_text else 0.0
+        except ValueError:
+            return None
+        if not math.isfinite(hours) or not math.isfinite(minutes) or minutes >= 60:
+            return None
+        return hours + minutes / 60
+    if ":" in raw:
+        hours_text, _, minutes_text = raw.partition(":")
+        try:
+            hours = float(hours_text or 0)
+            minutes = float(minutes_text)
+        except ValueError:
+            return None
+        if not math.isfinite(hours) or not math.isfinite(minutes) or minutes >= 60:
+            return None
+        return hours + minutes / 60
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def format_hours(hours: float) -> str:
+    """``11.83`` as ``11h50m``, and a whole value as ``11h``."""
+    if hours <= 0:
+        return "0"
+    whole = int(hours)
+    minutes = round((hours - whole) * 60)
+    if minutes == 60:
+        whole += 1
+        minutes = 0
+    if minutes == 0:
+        return f"{whole}h"
+    if whole == 0:
+        return f"{minutes}m"
+    return f"{whole}h{minutes:02d}m"
 
 
 def bare_name(channel: str) -> str:
@@ -186,7 +260,36 @@ class YouTubeConfig(BaseModel):
 
     privacy_status: Literal["public", "unlisted", "private"] = "unlisted"
     client_secrets_file: str = Field("client_secret.json", min_length=1)
+    #: Let YouTube end a broadcast when the encoder goes silent (about
+    #: 90 s). The app ends each broadcast itself: at stream end, at hold
+    #: end, and at a split handover. So the default is off. A short feed
+    #: stall, such as a segment gap, then keeps the same broadcast and
+    #: the same link. orphan_cleanup_hours below covers broadcasts that
+    #: a crash leaves behind.
+    enable_auto_stop: StrictBool = False
+    #: End old broadcasts that this app made and that no recording or
+    #: hold owns. A broadcast counts as old when its ingest has no data
+    #: for this many hours. Only broadcasts with the app marker in the
+    #: description count. Broadcasts from other tools stay safe. 0 turns
+    #: the sweep off.
+    orphan_cleanup_hours: NonNegativeFloat = 3
     hold_seconds: NonNegativeFloat = 0
+    #: Split one long restream into a chain of broadcasts of at most this
+    #: many hours each, with a hot handover. 0 keeps one broadcast for the
+    #: whole stream. YouTube archives a broadcast of 12 hours or less, and
+    #: it may capture nothing longer, so 11 is the useful value.
+    max_broadcast_hours: NonNegativeFloat = 0
+
+    @field_validator("max_broadcast_hours")
+    @classmethod
+    def _round_split_length(cls, v: NonNegativeFloat) -> NonNegativeFloat:
+        """Keep the split length to the second, the precision of the timer.
+
+        A hand edit can carry a long decimal from a minutes-to-hours
+        conversion (11:50 -> 11.833333333). Rounded to the second, the
+        entry stays readable, and unchanged by a later save.
+        """
+        return round(v, 4)
 
 
 class UpdateCheckConfig(BaseModel):
@@ -331,6 +434,53 @@ class MtprotoConfig(BaseModel):
         return self
 
 
+class TelegramLiveConfig(BaseModel):
+    """Telegram live restream: send captures to Telegram channels.
+
+    A user account runs this feature, not the bot. Bots cannot create a
+    channel, start a live stream, or read its RTMP address. The account
+    must own or manage each target channel. The api id and the api hash
+    identify the app: keep them in env vars, like the bot token. Run
+    ``stream-archive-setup-telegram-live`` once to log the account in.
+    The session file then holds the login.
+    """
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    enabled: StrictBool = False
+    api_id: int = Field(0, ge=0)
+    api_hash: StrictStr = ""
+    session: str = Field("telegram_live.session", min_length=1)
+    #: Create the target channel when a monitored channel has none yet.
+    #: The new channel is private. The app stores its peer id in
+    #: ``channel_telegram_peers`` at once, so a restart reuses it.
+    auto_create_channels: StrictBool = True
+    #: Start the Telegram server-side recording with each live stream.
+    #: The file lands in the account's Saved Messages when the stream
+    #: ends. Off by default: a long stream can pass the file size cap.
+    record: StrictBool = False
+    #: Append the start time to each live stream title, in the app
+    #: timezone: "author - title (2026-11-24 12:31 JST)".
+    title_timestamp: StrictBool = True
+    #: Post the finished chat log file to the Telegram channel when a
+    #: Telegram restream ends. Needs record_chat; without a chat file
+    #: there is nothing to post.
+    post_chat_log: StrictBool = True
+    #: Forward the server-side recording to the Telegram channel when
+    #: it lands in Saved Messages after the stream ends. Needs record;
+    #: the forwarded post is the channel's archive copy and its link
+    #: goes to the operator notification. Saved Messages itself has no
+    #: shareable link.
+    forward_recording: StrictBool = True
+
+    @model_validator(mode="after")
+    def _require_creds_when_enabled(self) -> TelegramLiveConfig:
+        if self.enabled and (self.api_id <= 0 or not self.api_hash.strip()):
+            msg = "telegram_live.api_id and telegram_live.api_hash are required when telegram_live.enabled is true"
+            raise ValueError(msg)
+        return self
+
+
 class AppConfig(BaseModel):
     """Typed, validated view of config.json.
 
@@ -363,6 +513,14 @@ class AppConfig(BaseModel):
     channel_output_modes: dict[str, OutputMode] = {}
     channel_youtube_hold_seconds: dict[str, NonNegativeFloat] = {}
     channel_youtube_vod_upload: dict[str, StrictBool] = {}
+    #: Monitored channel -> Telegram channel peer id (marked, -100...).
+    #: One Telegram channel can hold one live stream at a time, so each
+    #: monitored channel needs its own entry for parallel restreams.
+    channel_telegram_peers: dict[str, StrictInt] = {}
+    #: Monitored channel -> profile image URL last set as the Telegram
+    #: channel photo. The streamer compares it with the live URL at each
+    #: stream start, so a new broadcaster icon is picked up once.
+    channel_telegram_icon_urls: dict[str, StrictStr] = {}
     channel_preferred_qualities: dict[str, str] = {}
     channel_categories: dict[str, list[str]] = {}
     youtube: YouTubeConfig = YouTubeConfig()
@@ -370,12 +528,14 @@ class AppConfig(BaseModel):
     preferred_quality: str = Field("best", min_length=1)
     max_concurrent_recordings: NonNegativeFloat = 0
     max_concurrent_youtube_streams: NonNegativeFloat = 0
+    max_concurrent_telegram_streams: NonNegativeFloat = 0
     record_chat: StrictBool = True
     chat_dir: str = Field("chat", min_length=1)
     disk: DiskConfig = DiskConfig()
     eventsub: EventSubConfig = EventSubConfig()
     endpoint: EndpointConfig = EndpointConfig()
     mtproto: MtprotoConfig = MtprotoConfig()
+    telegram_live: TelegramLiveConfig = TelegramLiveConfig()
     kick: KickConfig = KickConfig()
     api: ApiConfig = ApiConfig()
     web: WebConfig = WebConfig()
@@ -449,6 +609,20 @@ class AppConfig(BaseModel):
     @classmethod
     def _normalize_vod_upload_keys(cls, v: dict[str, StrictBool]) -> dict[str, StrictBool]:
         return _normalize_channel_map(v, "channel_youtube_vod_upload")
+
+    @field_validator("channel_telegram_icon_urls")
+    @classmethod
+    def _normalize_telegram_icon_keys(cls, v: dict[str, StrictStr]) -> dict[str, StrictStr]:
+        return _normalize_channel_map(v, "channel_telegram_icon_urls")
+
+    @field_validator("channel_telegram_peers")
+    @classmethod
+    def _normalize_telegram_peer_keys(cls, v: dict[str, StrictInt]) -> dict[str, StrictInt]:
+        for ch, peer in v.items():
+            if peer == 0:
+                msg = f"channel_telegram_peers.{ch} must be a non-zero Telegram peer id"
+                raise ValueError(msg)
+        return _normalize_channel_map(v, "channel_telegram_peers")
 
     @field_validator("channel_categories")
     @classmethod

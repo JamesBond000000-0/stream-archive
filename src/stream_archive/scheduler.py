@@ -9,7 +9,7 @@ from aiohttp import web
 
 from stream_archive import events
 from stream_archive.api import ControlAPI
-from stream_archive.config import AppConfig, get_config, telegram_enabled
+from stream_archive.config import AppConfig, bare_name, get_config, is_kick_channel, telegram_enabled
 from stream_archive.eventsub import EventSubClient
 from stream_archive.http_client import build_http_client
 from stream_archive.kick_api import KickAPI
@@ -19,6 +19,7 @@ from stream_archive.mtproto_upload import MtprotoUploader
 from stream_archive.notifier import Notifier, NullNotifier
 from stream_archive.recorder import Recorder
 from stream_archive.telegram import TelegramController
+from stream_archive.telegram_streamer import TelegramLiveStreamer
 from stream_archive.twitch_api import TwitchAPI
 from stream_archive.updater import UpdateChecker, installed_app_version
 from stream_archive.uploads import UploadHub
@@ -102,6 +103,25 @@ async def _start_health_server(host: str = _HEALTH_HOST, port: int = _HEALTH_POR
     return runner
 
 
+def _profile_image_resolver(twitch_api: TwitchAPI, kick_api: KickAPI) -> Any:
+    """Build the Telegram channel photo lookup: channel -> image URL.
+
+    A failure answers None. The streamer treats icons as best effort,
+    so a platform outage must not surface in the stream start path.
+    """
+
+    async def resolve(channel: str) -> str | None:
+        try:
+            if is_kick_channel(channel):
+                return await kick_api.get_profile_image(bare_name(channel))
+            return await twitch_api.get_profile_image(bare_name(channel))
+        except Exception:
+            logger.warning("[scheduler] Profile image lookup failed for %s", channel, exc_info=True)
+            return None
+
+    return resolve
+
+
 async def run_scheduler() -> None:
     global _shutdown_event, _READY
     _setup_signal_handlers()
@@ -135,6 +155,7 @@ async def run_scheduler() -> None:
     twitch_api: TwitchAPI | None = None
     notifier: Notifier | None = None
     youtube_streamer: YouTubeStreamer | None = None
+    telegram_streamer: TelegramLiveStreamer | None = None
     recorder: Recorder | None = None
     kick_api: KickAPI | None = None
     eventsub: EventSubClient | None = None
@@ -144,6 +165,7 @@ async def run_scheduler() -> None:
     telegram: TelegramController | None = None
     mtproto: MtprotoUploader | None = None
     repair_task: asyncio.Task[None] | None = None
+    orphan_task: asyncio.Task[None] | None = None
     upload_hub: Any = None
     # Every resource inside the try below shuts down in order. A failed
     # Telegram start, for example, must not leave a recording or a held
@@ -161,7 +183,16 @@ async def run_scheduler() -> None:
         youtube_streamer = YouTubeStreamer(config)
         logger.info("YouTube streaming enabled (privacy: %s)", config.youtube.privacy_status)
 
-        recorder = Recorder(config, youtube_streamer, notifier)
+        # Built only when the feature is on: the streamer holds a user
+        # session, and a mode that never uses it must not need one. The
+        # login itself is lazy: the first Telegram restream connects.
+        if config.telegram_live.enabled:
+            telegram_streamer = TelegramLiveStreamer(config)
+            logger.info(
+                "Telegram live streaming enabled (auto-create channels: %s)", config.telegram_live.auto_create_channels
+            )
+
+        recorder = Recorder(config, youtube_streamer, notifier, telegram_streamer=telegram_streamer)
         monitor = Monitor(recorder, notifier)
 
         upload_hub = UploadHub()
@@ -200,6 +231,9 @@ async def run_scheduler() -> None:
         monitor.on_stopped = _maybe_auto_upload
 
         kick_api = KickAPI(config, http=shared_http)
+
+        if telegram_streamer is not None:
+            telegram_streamer.set_profile_image_resolver(_profile_image_resolver(twitch_api, kick_api))
 
         eventsub = EventSubClient(twitch_api, monitor, config)
         kick_webhook = KickWebhook(config, monitor, recorder, kick_api, notifier)
@@ -264,6 +298,7 @@ async def run_scheduler() -> None:
         # finishes that work in the background with no deadline. Boot never
         # waits for it: multi-GB files take minutes.
         repair_task = asyncio.create_task(_repair_after_boot(recorder))
+        orphan_task = asyncio.create_task(recorder.run_orphan_cleanup_loop())
         await _run_loop(monitor, twitch_api, kick_api, config, recorder)
     except asyncio.CancelledError:
         logger.info("[scheduler] Scheduler task cancelled, shutting down")
@@ -280,9 +315,11 @@ async def run_scheduler() -> None:
             updater_task=updater_task,
             telegram=telegram,
             youtube_streamer=youtube_streamer,
+            telegram_streamer=telegram_streamer,
             shared_http=shared_http,
             mtproto=mtproto,
             repair_task=repair_task,
+            orphan_task=orphan_task,
             upload_hub=upload_hub,
         )
 
@@ -433,8 +470,10 @@ async def _shutdown(
     telegram: TelegramController | None,
     youtube_streamer: YouTubeStreamer | None,
     shared_http: Any,
+    telegram_streamer: TelegramLiveStreamer | None = None,
     mtproto: MtprotoUploader | None = None,
     repair_task: asyncio.Task[None] | None = None,
+    orphan_task: asyncio.Task[None] | None = None,
     upload_hub: Any = None,
 ) -> None:
     """Close everything in order. Each close has its own guard, so one failure never skips the rest.
@@ -453,6 +492,12 @@ async def _shutdown(
             await asyncio.gather(repair_task, return_exceptions=True)
         except Exception:
             logger.error("[scheduler] remux repair cancel failed", exc_info=True)
+    if orphan_task is not None:
+        try:
+            orphan_task.cancel()
+            await asyncio.gather(orphan_task, return_exceptions=True)
+        except Exception:
+            logger.error("[scheduler] orphan sweep cancel failed", exc_info=True)
     if notifier is not None:
         try:
             await notifier.notify_shutdown()
@@ -554,6 +599,11 @@ async def _shutdown(
             await youtube_streamer.close()
         except Exception:
             logger.error("[scheduler] youtube streamer close failed", exc_info=True)
+    if telegram_streamer is not None:
+        try:
+            await telegram_streamer.close()
+        except Exception:
+            logger.error("[scheduler] telegram streamer close failed", exc_info=True)
     if notifier is not None:
         try:
             await notifier.close()

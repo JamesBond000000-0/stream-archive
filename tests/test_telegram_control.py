@@ -7,6 +7,7 @@ import types
 import unittest.mock
 from datetime import UTC, datetime
 
+import pytest
 from conftest import kb_labels, read_file
 from conftest import make_config as valid_config
 from telegram import Chat, Message, Update
@@ -408,7 +409,10 @@ def test_mode_usage_too_many_args(tmp_path):
     config, ctrl, _, _, eventsub = make_controller(tmp_path)
     before = read_file(tmp_path)
     text = ctrl.handle_mode(["a", "b", "c"])
-    assert text == "Usage: /mode <disk|youtube|both> or /mode <channel> <disk|youtube|both|default>"
+    assert text == (
+        "Usage: /mode <disk|youtube|both|telegram|telegram_both> "
+        "or /mode <channel> <disk|youtube|both|telegram|telegram_both|default>"
+    )
     assert read_file(tmp_path) == before
 
 
@@ -1180,6 +1184,7 @@ def test_reply_keyboard_channel_layout(tmp_path):
     ]
     assert ctrl.reply_keyboard("channel_mode", "twitch:channel1").to_dict()["keyboard"] == [
         [{"text": "Disk"}, {"text": "YouTube"}, {"text": "Both"}],
+        [{"text": "Telegram"}, {"text": "Telegram+Disk"}],
         [{"text": "\u2713 Global"}],
         [{"text": "Back"}],
     ]
@@ -1260,7 +1265,7 @@ def test_reply_text_channel_submenu_mode(tmp_path):
     assert "global (disk)" in text
     text, markup = asyncio.run(ctrl.handle_reply_text("Mode"))
     assert "Output mode for twitch:channel1: global (disk)" in text
-    assert kb_labels(markup) == ["Disk", "YouTube", "Both", "\u2713 Global", "Back"]
+    assert kb_labels(markup) == ["Disk", "YouTube", "Both", "Telegram", "Telegram+Disk", "\u2713 Global", "Back"]
     text, markup = asyncio.run(ctrl.handle_reply_text("YouTube"))
     assert read_file(tmp_path)["channel_output_modes"] == {"twitch:channel1": "youtube"}
     assert config.channel_output_modes == {"twitch:channel1": "youtube"}
@@ -2598,6 +2603,31 @@ def test_handle_channel_hold_invalid(tmp_path):
         text = ctrl.handle_channel_hold(args)
         assert text.startswith("\u274c")
     assert read_file(tmp_path) == before
+
+
+def test_split_length_accepts_hours_and_minutes(tmp_path):
+    """11:50 must mean 11 hours 50 minutes, not 11 hours.
+
+    A split length near the 12-hour archive limit is usually typed as
+    hours and minutes. The command must read that form, keep it in
+    config.json, and reject a bad value without writing.
+    """
+    config, ctrl, _, _, _ = make_controller(tmp_path)
+
+    assert ctrl.handle_split_hours(["11:50"]).endswith(
+        "(0 = one broadcast; keep it under 12h so YouTube keeps the replay)"
+    )
+    # The config keeps the length to the second (11:50 is 11.8333 hours).
+    assert config.youtube.max_broadcast_hours == pytest.approx(11 + 50 / 60, abs=1e-4)
+    assert read_file(tmp_path)["youtube"]["max_broadcast_hours"] == pytest.approx(11 + 50 / 60, abs=1e-4)
+    assert ctrl.handle_split_hours(["11h50m"]).startswith("Split length set to 11h50m")
+    assert config.youtube.max_broadcast_hours == pytest.approx(11 + 50 / 60, abs=1e-4)
+
+    saved = read_file(tmp_path)["youtube"]["max_broadcast_hours"]
+    for bad in (["11:70"], ["soon"], ["-1"]):
+        assert ctrl.handle_split_hours(bad).startswith("\u274c")
+    assert ctrl.handle_split_hours(["11", "5"]).startswith("Usage:")
+    assert read_file(tmp_path)["youtube"]["max_broadcast_hours"] == saved
 
 
 def test_remove_clears_hold_override(tmp_path):

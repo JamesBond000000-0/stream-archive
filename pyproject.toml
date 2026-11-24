@@ -31,6 +31,7 @@ dependencies = [
 stream-archive = "stream_archive.scheduler:main"
 stream-archive-setup = "stream_archive.setup_wizard:main"
 stream-archive-setup-youtube = "stream_archive.setup_youtube:main"
+stream-archive-setup-telegram-live = "stream_archive.setup_telegram_live:main"
 stream-archive-setup-web = "stream_archive.setup_web:main"
 
 [tool.hatch.build.targets.wheel]

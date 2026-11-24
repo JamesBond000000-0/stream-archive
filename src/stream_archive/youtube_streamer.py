@@ -13,7 +13,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
 from stream_archive.config import AppConfig, channel_url, is_kick_channel
-from stream_archive.recorder.common import sanitize_metadata_text
+from stream_archive.recorder.common import RECORDED_BY_MARKER, sanitize_metadata_text
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +90,7 @@ def build_video_description(author: str, channel: str, game: str) -> str:
         f"{platform} stream by {author}\n"
         f"Game: {game}\n"
         f"Originally streamed at: {channel_url(channel)}\n"
-        "Recorded by StreamArchive"
+        f"{RECORDED_BY_MARKER}"
     )
 
 
@@ -98,6 +98,7 @@ class YouTubeStreamer:
     def __init__(self, config: AppConfig):
         yt = config.youtube
         self._privacy_status = yt.privacy_status
+        self._enable_auto_stop = yt.enable_auto_stop
         self._token_path = config.workdir / TOKEN_NAME
         self._credentials: Credentials | None = None
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(15, connect=5))
@@ -233,7 +234,7 @@ class YouTubeStreamer:
             },
             "contentDetails": {
                 "enableAutoStart": True,
-                "enableAutoStop": True,
+                "enableAutoStop": self._enable_auto_stop,
                 "enableDvr": True,
             },
         }
@@ -330,6 +331,51 @@ class YouTubeStreamer:
         status = first.get("status") if isinstance(first, dict) else None
         life = status.get("lifeCycleStatus") if isinstance(status, dict) else None
         return life if isinstance(life, str) else None
+
+    async def list_active_broadcasts(self) -> list[dict[str, Any]]:
+        """List my broadcasts that are not complete, with their ingest ids.
+
+        Each item keeps the raw API fields the orphan sweep needs: ``id``,
+        ``status``, ``contentDetails`` (the bound stream id), and
+        ``snippet`` (the description marker and the start times). One page
+        of 50 is enough: an account with more active broadcasts than that
+        has a bigger problem than orphans.
+        """
+        payload = await self._request(
+            "GET",
+            "liveBroadcasts",
+            params={
+                "part": "status,contentDetails,snippet",
+                "mine": "true",
+                "broadcastStatus": "active",
+                "maxResults": 50,
+            },
+        )
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return []
+        return [item for item in items if isinstance(item, dict)]
+
+    async def get_stream_health(self, stream_id: str) -> tuple[str | None, str | None]:
+        """Return (streamStatus, health) of one ingest, or (None, None).
+
+        ``streamStatus`` is ``active`` while data flows and ``inactive``
+        when it does not. ``health`` is ``good`` or ``noData``.
+        """
+        payload = await self._request("GET", "liveStreams", params={"id": stream_id, "part": "status"})
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list) or not items:
+            return None, None
+        status = items[0].get("status") if isinstance(items[0], dict) else None
+        if not isinstance(status, dict):
+            return None, None
+        stream_status = status.get("streamStatus")
+        health = status.get("healthStatus")
+        health_status = health.get("status") if isinstance(health, dict) else None
+        return (
+            stream_status if isinstance(stream_status, str) else None,
+            health_status if isinstance(health_status, str) else None,
+        )
 
     async def close(self) -> None:
         # Let an in-flight rollback finish first: it is removing resources that

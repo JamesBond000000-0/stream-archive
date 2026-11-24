@@ -60,6 +60,7 @@ class Recording(TypedDict, total=False):
     user_id: str | None
     filepath: str | None
     youtube_info: dict[str, Any] | None
+    telegram_info: dict[str, Any] | None
     started_at: float
     tasks: list[asyncio.Task[Any]]
     # streamlink ships no type stubs, so the stream objects that feed these
@@ -70,6 +71,9 @@ class Recording(TypedDict, total=False):
     watchdog: asyncio.Task[Any] | None
     failed: bool
     reused: bool
+    #: Monotonic start of the current YouTube broadcast. It moves at each
+    #: split, while ``started_at`` stays at the start of the whole capture.
+    part_started_at: float
 
 
 class HoldState(TypedDict):

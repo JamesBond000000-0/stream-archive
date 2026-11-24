@@ -79,13 +79,14 @@ class CredentialsStub:
         return self.creds
 
 
-def make_streamer(tmp_path, creds):
+def make_streamer(tmp_path, creds, **overrides):
     """Build a streamer on a valid config, bound to tmp_path as the workdir.
 
     The shared defaults differ here: the channel is twitch:ch and the
     recordings live in tmp_path, where the token file also lives.
+    ``overrides`` win over these defaults.
     """
-    cfg = valid_config(channels=["twitch:ch"], recording_dir=str(tmp_path))
+    cfg = valid_config(channels=["twitch:ch"], recording_dir=str(tmp_path), **overrides)
     cfg._workdir = tmp_path
     stub = CredentialsStub(creds)
     return YouTubeStreamer(cfg), stub
@@ -245,6 +246,30 @@ class _Response:
 
     def raise_for_status(self):
         return None
+
+
+@pytest.mark.parametrize("override, expected", [(None, False), (True, True), (False, False)])
+def test_create_stream_sends_the_configured_auto_stop(tmp_path, monkeypatch, override, expected):
+    """The create body carries the config flag, and the default is off.
+
+    Regression: the body once hardcoded ``enableAutoStop: true``, so
+    YouTube ended the broadcast about 90 s after any feed stall and the
+    restream died on the same link while the app kept feeding it.
+    """
+    creds = FakeCreds()
+    creds.valid = True
+    creds.expired = False
+    (tmp_path / "youtube_token.json").write_text(json.dumps(TOKEN_DATA))
+    overrides = {} if override is None else {"youtube": {"enable_auto_stop": override}}
+    streamer, stub = make_streamer(tmp_path, creds, **overrides)
+    monkeypatch.setattr("stream_archive.youtube_streamer.Credentials", stub)
+    client = _RecordingClient()
+    streamer._client = client
+
+    asyncio.run(streamer.create_stream("author", "title", "twitch:ch", "game"))
+
+    inserts = [call for call in client.calls if call[:2] == ("POST", "liveBroadcasts")]
+    assert inserts and inserts[0][3]["contentDetails"]["enableAutoStop"] is expected
 
 
 def test_cancelled_create_rolls_back_the_broadcast_and_stream(tmp_path, monkeypatch):

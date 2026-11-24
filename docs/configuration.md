@@ -30,7 +30,7 @@ Keys marked **hand edit** stay read-only over the Telegram bot, the web panel, a
 | `recording_dir` | yes | — | Directory for `.ts`/`.m4a` recordings |
 | `record_chat` | no | `true` | Record Twitch IRC chat alongside the video |
 | `chat_dir` | no | `chat` | Directory for chat JSON files (`chat_dir/<platform>/<channel>/<title>-<ts>.chat.json`). See [Chat recording](chat-recording.md) |
-| `output_mode` | no | `disk` | `disk`, `youtube`, or `both` |
+| `output_mode` | no | `disk` | `disk`, `youtube`, `both`, `telegram`, or `telegram_both` (Telegram live, with a disk copy) |
 | `channel_output_modes` | no | `{}` | Per-channel override, for example `{"twitch:channel": "disk"}`. Channels without an entry use `output_mode`. A bare key means `twitch:` |
 | `eventsub.enabled` | no | `true` | Twitch EventSub fast path through a conduit. It uses the app credentials and needs no extra setup. `false` gives Twitch polling only |
 | `kick.client_id` | yes¹, hand edit | — | Kick app client id. Required with a `kick:` channel |
@@ -60,13 +60,28 @@ Keys marked **hand edit** stay read-only over the Telegram bot, the web panel, a
 | `channel_categories` | no | `{}` | Per-channel category filter, for example `{"twitch:channel": ["Just Chatting", "Music"]}`. Channels without an entry record every live stream. A bare key means `twitch:`. The match ignores case. A blank live category never matches a filter. Hand edits skip the platform check below: the Telegram bot and the control API check each name and refuse unknown names |
 | `max_concurrent_recordings` | no | `0` | Maximum simultaneous recordings. `0` means unlimited |
 | `max_concurrent_youtube_streams` | no | `0` | Maximum simultaneous YouTube restreams. `0` means unlimited |
+| `max_concurrent_telegram_streams` | no | `0` | Maximum simultaneous Telegram restreams. `0` means unlimited |
+| `channel_telegram_peers` | no | `{}` | Monitored channel -> Telegram channel peer id (marked, `-100...`). One Telegram channel holds one live stream at a time, so each monitored channel needs its own entry for parallel restreams. The app adds an entry when it creates a channel. A bare key means `twitch:` |
+| `telegram_live.enabled` | no | `false` | Send restreams to Telegram channels. Needs a user account login. See [Telegram live](telegram-live.md) |
+| `telegram_live.api_id` | yes⁴ | `0` | Telegram app api id from my.telegram.org. Use `${TELEGRAM_API_ID}`. Required when `telegram_live.enabled` is true |
+| `telegram_live.api_hash` | yes⁴ | `""` | Telegram app api hash from my.telegram.org. Use `${TELEGRAM_API_HASH}`. Same requirement |
+| `telegram_live.session` | no, hand edit | `telegram_live.session` | Session file of the Telegram user login, relative to the data dir. Keep it private: it is a full account login |
+| `telegram_live.auto_create_channels` | no | `true` | Create a private Telegram channel when a monitored channel has no entry in `channel_telegram_peers` yet, and store its peer id |
+| `telegram_live.record` | no | `false` | Start the Telegram server-side recording with each live stream. The file lands in the account's Saved Messages when the stream ends |
+| `telegram_live.title_timestamp` | no | `true` | Append the start time (app timezone) to each Telegram live stream title |
+| `telegram_live.post_chat_log` | no | `true` | Post the finished chat log file to the Telegram channel when a restream ends. Needs `record_chat` |
+| `telegram_live.forward_recording` | no | `true` | Forward the server-side recording from Saved Messages to the Telegram channel after the stream ends, and notify the operator with its link. Needs `telegram_live.record` |
+| `channel_telegram_icon_urls` | no | `{}` | Monitored channel -> profile image URL last set as the Telegram channel photo. The app maintains this; a hand edit forces a re-set at the next stream |
 | `disk.max_total_gb` | no | `0` | Delete the oldest archive files when the total exceeds this size in GB. `0` disables the cap |
 | `disk.check_interval_s` | no, hand edit | `60` | Seconds between disk watchdog checks |
 | `disk.delete_oldest` | no | `true` | On a breach, delete the oldest archive files. `false` stops new recordings instead |
 | `update_check.enabled` | no, hand edit | `true` | Periodic check for a newer app release, with a Telegram notification when one is available |
 | `update_check.interval_hours` | no, hand edit | `24` | Hours between update checks |
 | `youtube.client_secrets_file` | no, hand edit | `client_secret.json` | Path to the Google OAuth client file |
+| `youtube.enable_auto_stop` | no, hand edit | `false` | Let YouTube end a broadcast when the encoder goes silent (about 90 s). The app ends each broadcast itself, so the default is off: a short feed stall keeps the same broadcast and the same link |
+| `youtube.orphan_cleanup_hours` | no, hand edit | `3` | End broadcasts this app made that no recording or hold owns, once the ingest has no data for this many hours. Only broadcasts with the app marker in the description count. `0` turns the sweep off |
 | `youtube.privacy_status` | no, hand edit | `unlisted` | Privacy of created YouTube broadcasts and VOD uploads: `public`, `unlisted`, or `private` |
+| `youtube.max_broadcast_hours` | no | `0` | Split one long restream into a chain of broadcasts of at most this many hours each. The next broadcast starts before the old one ends, so the live feed has no gap. Viewers of the old link move to the new one. `0` keeps one broadcast. YouTube archives a broadcast of 12 hours or less and may capture nothing longer, so `11` or `11.83` (11 h 50 m) is the useful value. The config keeps the length to the second. `/split` and the control API also take `11:50` and `11h50m` |
 | `youtube.hold_seconds` | no, hand edit | `0` | Keep the broadcast open this many seconds after the source stops. A return within the delay reuses the same broadcast. `0` ends the broadcast at once |
 | `channel_youtube_hold_seconds` | no | `{}` | Per-channel override of `youtube.hold_seconds`, for example `{"twitch:channel": 60}`. An absent entry uses the global value. A bare key means `twitch:` |
 | `channel_youtube_vod_upload` | no | `{}` | Per-channel YouTube auto-upload of finished recordings, for example `{"twitch:channel": true}`. An absent entry means off |
@@ -74,11 +89,15 @@ Keys marked **hand edit** stay read-only over the Telegram bot, the web panel, a
 ¹ Required when the channel list holds a `kick:` entry.
 ² Required when the endpoint is enabled.
 ³ Required when MTProto upload is enabled.
+⁴ Required when Telegram live is enabled.
 
 `output_mode: youtube` also needs the file `youtube_token.json`. See [YouTube restream](youtube-setup.md).
+
+`output_mode: telegram` and `telegram_both` need `telegram_live.enabled` and a logged-in user session. See [Telegram live](telegram-live.md).
 
 ## Related guides
 
 - [Kick webhook](kick-webhook.md) sets the public URLs for deliveries.
 - [Control API](control-api.md) changes channels and settings over HTTP.
 - [Web panel](web-control.md) replaces the Telegram bot in the browser.
+- [Telegram live](telegram-live.md) restreams to Telegram channels with a user account.

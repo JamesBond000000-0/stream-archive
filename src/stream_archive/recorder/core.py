@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Coroutine
-from contextlib import nullcontext, suppress
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -20,6 +20,9 @@ from stream_archive.chat_recorder import ChatRecorder
 from stream_archive.chat_writer import ChatJsonWriter
 from stream_archive.config import (
     AUDIO_ONLY_QUALITY,
+    DISK_MODES,
+    TELEGRAM_MODES,
+    YOUTUBE_MODES,
     AppConfig,
     bare_name,
     channel_url,
@@ -38,11 +41,13 @@ from stream_archive.recorder.remux import (
     remux_ts_to_mp4_async,
 )
 from stream_archive.recorder.streamlink_source import StreamlinkMixin
+from stream_archive.recorder.telegram_output import TelegramOutputMixin
 from stream_archive.recorder.types import HoldState, KickChatState, Recording
 from stream_archive.recorder.youtube_output import YoutubeOutputMixin
 
 if TYPE_CHECKING:
     from stream_archive.notifier import Notifier
+    from stream_archive.telegram_streamer import TelegramLiveStreamer
     from stream_archive.youtube_streamer import YouTubeStreamer
 
 logger = logging.getLogger(__name__)
@@ -60,9 +65,10 @@ def _require_filepath(entry: Recording, channel: str) -> str:
     return disk_filepath
 
 
-class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputMixin):
+class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, TelegramOutputMixin, ChatOutputMixin):
     _config: AppConfig
     _youtube: YouTubeStreamer | None
+    _telegram: TelegramLiveStreamer | None
     _notifier: Notifier | None
     _recordings: dict[str, Recording]
     _locks: dict[str, asyncio.Lock]
@@ -76,6 +82,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
     _youtube_auth_alerted: bool
     _youtube_budget_lock: asyncio.Lock
     _held: dict[str, HoldState]
+    _orphan_first_seen: dict[str, float]
     _reserve_lock: asyncio.Lock
     _reserved_channels: dict[str, str]
     _bg_tasks: set[asyncio.Task[Any]]
@@ -85,12 +92,17 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         config: AppConfig,
         youtube_streamer: YouTubeStreamer | None = None,
         notifier: Notifier | None = None,
+        telegram_streamer: TelegramLiveStreamer | None = None,
     ) -> None:
         self._config = config
         self._youtube = youtube_streamer
+        self._telegram = telegram_streamer
         self._notifier = notifier
         self._recordings = {}
         self._locks = {}
+        #: Background finalize follow-ups (the recording forward). The
+        #: set holds the tasks so they are not collected mid-flight.
+        self._post_tasks: set[asyncio.Task[Any]] = set()
         self._session = Streamlink()
         # Short HTTP timeout: a dead playlist proxy must fail over fast
         # instead of burning 30 s per proxy before the recording starts.
@@ -113,6 +125,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         # record, so concurrent starts cannot all pass the check.
         self._youtube_budget_lock = asyncio.Lock()
         self._held = {}  # channel -> hold dict (broadcast kept open awaiting reuse)
+        self._orphan_first_seen = {}  # broadcast id -> first sweep that saw it orphaned (monotonic)
         self._ended_clean: dict[str, float] = {}  # channel -> monotonic end time (clean stream over)
         #: Final filepath of a clean end, for the monitor auto-upload hook.
         #: Set after finalize (the remux can rename the file) and consumed
@@ -150,12 +163,19 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             if max_rec > 0 and len(self._recordings) + len(self._reserved_channels) >= max_rec:
                 return f"concurrent recording limit reached ({max_rec}/{max_rec})"
             max_yt = self._config.max_concurrent_youtube_streams
-            if max_yt > 0 and mode in ("youtube", "both"):
+            if max_yt > 0 and mode in YOUTUBE_MODES:
                 yt_busy = self.youtube_active_count() + sum(
-                    1 for m in self._reserved_channels.values() if m in ("youtube", "both")
+                    1 for m in self._reserved_channels.values() if m in YOUTUBE_MODES
                 )
                 if yt_busy >= max_yt:
                     return f"YouTube re-stream limit reached ({max_yt}/{max_yt})"
+            max_tg = self._config.max_concurrent_telegram_streams
+            if max_tg > 0 and mode in TELEGRAM_MODES:
+                tg_busy = self.telegram_active_count() + sum(
+                    1 for m in self._reserved_channels.values() if m in TELEGRAM_MODES
+                )
+                if tg_busy >= max_tg:
+                    return f"Telegram re-stream limit reached ({max_tg}/{max_tg})"
             self._reserved_channels[channel] = mode
             return None
 
@@ -282,12 +302,20 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                 channel,
                 raw_mode,
             )
-        if mode != "disk" and self._youtube is None:
+        if mode in YOUTUBE_MODES and self._youtube is None:
             # Fail before the resolve. Without a streamer the task list stays
             # empty, the entry comes straight back out, and every monitor tick
             # repeats the same silent start.
             logger.error(
                 "[recorder] [%s] Output mode is %s but no YouTube streamer is configured. Check the YouTube settings.",
+                channel,
+                mode,
+            )
+            return False
+        if mode in TELEGRAM_MODES and self._telegram is None:
+            logger.error(
+                "[recorder] [%s] Output mode is %s but no Telegram live streamer is configured. "
+                "Check the telegram_live settings.",
                 channel,
                 mode,
             )
@@ -331,7 +359,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         # not turn into an UnboundLocalError that masks the real error.
         tasks: list[asyncio.Task[Any]] = []
         try:
-            entry: Recording = {"tasks": [], "youtube_info": None, "filepath": None}
+            entry: Recording = {"tasks": [], "youtube_info": None, "telegram_info": None, "filepath": None}
             entry["started_at"] = time.monotonic()
             entry["mode"] = mode
             self._recordings[channel] = entry
@@ -344,7 +372,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             now = datetime.now(ZoneInfo(self._config.timezone)).strftime("%d_%m_%Y-%H%M%S")
             safe_title = sanitize_filename(stream_title)
 
-            if mode in ("disk", "both"):
+            if mode in DISK_MODES:
                 recording_dir = str(disk.channel_recording_dir(self._config, self._channel_dir(channel)))
                 os.makedirs(recording_dir, exist_ok=True)
                 extension = ".m4a" if entry["quality"] == AUDIO_ONLY_QUALITY else ".ts"
@@ -358,7 +386,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                 # The live notification goes out at the end of this method.
                 # A task that ends during that wait then finds its task list
                 # here, and the entry cannot stay behind without a task.
-            elif self._youtube is not None:  # mode youtube or both
+            elif mode in YOUTUBE_MODES and self._youtube is not None:
                 yt_task = self._track(
                     channel,
                     self._stream_youtube(
@@ -373,6 +401,21 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                     ),
                 )
                 tasks.append(yt_task)
+            elif mode in TELEGRAM_MODES and self._telegram is not None:
+                tg_task = self._track(
+                    channel,
+                    self._stream_telegram(
+                        channel,
+                        author,
+                        stream_title,
+                        stream_game,
+                        best,
+                        entry["filepath"] if mode == "telegram_both" else None,
+                        notify=notify,
+                        telegram_notify=youtube_notify,
+                    ),
+                )
+                tasks.append(tg_task)
 
             if not tasks:
                 del self._recordings[channel]
@@ -474,6 +517,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
 
         chat_recorder = entry.pop("chat_recorder", None)
         youtube_info = entry.get("youtube_info")
+        telegram_info = entry.get("telegram_info")
         await self._finalize_entry(channel, entry, chat_recorder, finish_media=finish_media)
 
         filepath = entry.get("filepath")
@@ -491,7 +535,12 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
                     "date": mtime.astimezone(ZoneInfo(self._config.timezone)).strftime("%d-%m-%Y %H:%M"),
                 }
 
-        return {"file_info": file_info, "youtube_info": youtube_info, "filepath": filepath}
+        return {
+            "file_info": file_info,
+            "youtube_info": youtube_info,
+            "telegram_info": telegram_info,
+            "filepath": filepath,
+        }
 
     async def restart(self, channel: str) -> bool:
         """Stop and immediately restart a recording with the current config.
@@ -593,7 +642,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         if cancelled is not None:
             raise cancelled
 
-    def _spawn_bg(self, coro: Coroutine[Any, Any, Any]) -> None:
+    def _spawn_bg(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
         """Run a finalize coroutine in the background, with a held reference.
 
         The event loop keeps only a weak reference, so a bare task can be
@@ -604,6 +653,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         task = asyncio.create_task(coro)
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_done)
+        return task
 
     def _bg_done(self, task: asyncio.Task[Any]) -> None:
         """Release a finished background task, and log its failure.
@@ -745,6 +795,11 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         self, channel: str, entry: Recording, chat_recorder: ChatRecorder | None, *, finish_media: bool = True
     ) -> None:
         """Finalize the chat capture, the broadcast, and the held state."""
+        # Read the chat paths before the finalizers run: they close the
+        # writers and may drop the state that holds them.
+        chat_path = getattr(chat_recorder, "chat_path", None) if chat_recorder else None
+        kick_state = entry.get("kick_chat")
+        kick_chat_path = kick_state.get("path") if kick_state else None
         if chat_recorder:
             # _finalize_chat releases the writer's paths. Stopping the capture
             # directly would leave its chat file protected from the archive
@@ -754,6 +809,17 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
         youtube_info = entry.get("youtube_info")
         if youtube_info:
             await self._release_broadcast(channel, youtube_info, entry)
+        telegram_info = entry.get("telegram_info")
+        if telegram_info:
+            await self._end_telegram_stream(channel, telegram_info)
+            # The chat file is final now. A discarded kick file (no
+            # messages) simply does not exist, so the exists check is
+            # the gate for both platforms.
+            for path in (chat_path, kick_chat_path):
+                if path and os.path.exists(path):
+                    await self._post_chat_log_file(channel, entry, path)
+                    break
+            self._schedule_recording_forward(channel, entry, telegram_info)
         if not finish_media:
             return
         await self._remux_finished_file(entry)
@@ -860,95 +926,6 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, ChatOutputM
             )
         return out
 
-    async def _pipe_stream(
-        self,
-        channel: str,
-        stream: Any,
-        process: Any,
-        filepath: str | None,
-        youtube_stop: asyncio.Event | None = None,
-    ) -> tuple[bool, str | None, bool]:
-        """Copy one source stream into ffmpeg stdin and, for ``both``, a file.
-
-        Return ``(clean, youtube_error, youtube_abandoned)``. ``clean`` is
-        True only when the source reached EOF. ``youtube_error`` names an
-        ingest write failure (for example a takedown that closed the RTMP
-        connection), or None when the ingest never broke. A source read
-        failure reports ``(False, None, False)``: the ingest did not fail,
-        the feed did. When ``youtube_stop`` is set (the broadcast was
-        revoked while the ingest stays open), the pipe closes the ffmpeg
-        stdin and keeps writing the disk file alone, reporting
-        ``youtube_abandoned`` True. The disk file keeps every byte written
-        before and after the break, and the caller finalizes it like any
-        other stopped capture.
-        """
-        loop = asyncio.get_running_loop()
-        clean = False
-        youtube_error: str | None = None
-        youtube_abandoned = False
-        stdin = getattr(process, "stdin", None)
-        try:
-            fd = await _open_stream(stream)
-        except Exception as e:
-            logger.error("[recorder] [youtube] %s stream open failed: %s", channel, e)
-            return (False, None, False)
-
-        file_handle = None
-        try:
-            if filepath:
-                os.makedirs(os.path.dirname(filepath), exist_ok=True)
-            with open(filepath, "wb") if filepath else nullcontext() as file_handle:
-                while True:
-                    if youtube_stop is not None and youtube_stop.is_set() and not youtube_abandoned:
-                        youtube_abandoned = True
-                        logger.warning("[recorder] [youtube] %s broadcast revoked, stopping the ingest feed", channel)
-                        if stdin is not None:
-                            with suppress(Exception):
-                                stdin.close()
-                        if filepath is None:
-                            break
-                        continue
-                    try:
-                        data = await loop.run_in_executor(None, fd.read, 65536)
-                    except Exception as e:
-                        logger.error("[recorder] [youtube] %s read error: %s", channel, e)
-                        break
-                    if not data:
-                        clean = True
-                        break
-
-                    if file_handle:
-                        # The archive volume can be slow. Write on the
-                        # executor, like the reads.
-                        await loop.run_in_executor(None, file_handle.write, data)
-
-                    if youtube_abandoned:
-                        continue
-                    if stdin is None:
-                        youtube_error = "ffmpeg is not running"
-                        logger.error("[recorder] [youtube] %s pipe error: %s", channel, youtube_error)
-                        break
-                    try:
-                        stdin.write(data)
-                        await stdin.drain()
-                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
-                        youtube_error = f"YouTube ingest failed: {e}"
-                        logger.warning("[recorder] [youtube] %s %s", channel, youtube_error)
-                        break
-                    except Exception as e:
-                        youtube_error = f"YouTube ingest failed: {e}"
-                        logger.error("[recorder] [youtube] %s %s", channel, youtube_error)
-                        break
-
-                logger.info("[recorder] [youtube] %s pipe finished", channel)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.error("[recorder] [youtube] %s pipe error: %s", channel, e)
-        finally:
-            with suppress(Exception):
-                fd.close()
-            with suppress(Exception):
-                if stdin is not None:
-                    stdin.close()
-        return (clean, youtube_error, youtube_abandoned)
+    async def _open_feed(self, stream: Any) -> Any:
+        """Open the streamlink feed. Raise when it cannot open."""
+        return await _open_stream(stream)

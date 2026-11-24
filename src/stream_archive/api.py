@@ -34,6 +34,7 @@ from stream_archive.config import (
     endpoint_base_url,
     normalize_channel_name,
     normalize_endpoint_url,
+    parse_hours,
 )
 from stream_archive.http_guard import FailBudget, read_json_object
 from stream_archive.telegram.menu_state import is_error
@@ -68,11 +69,13 @@ _SETTING_KEYS = (
     "retention_days",
     "max_concurrent_recordings",
     "max_concurrent_youtube_streams",
+    "max_concurrent_telegram_streams",
     "record_chat",
     "kick_record_chat",
     "disk_max_total_gb",
     "disk_delete_oldest",
     "youtube_hold_seconds",
+    "youtube_max_broadcast_hours",
     "endpoint_enabled",
     "endpoint_public_url",
     "kick_webhook_enabled",
@@ -84,11 +87,11 @@ _SETTING_KEYS = (
 _CHANNEL_SETTING_KEYS = ("output_mode", "quality", "youtube_hold_seconds", "youtube_vod_upload", "categories")
 
 #: Output modes, plus 'default' to clear a per-channel override.
-_OUTPUT_MODES = ("disk", "youtube", "both", "default")
+_OUTPUT_MODES = ("disk", "youtube", "both", "telegram", "telegram_both", "default")
 
 #: Output modes for the global setting. 'default' clears a per-channel
 #: override, so it has no meaning here.
-_GLOBAL_OUTPUT_MODES = ("disk", "youtube", "both")
+_GLOBAL_OUTPUT_MODES = ("disk", "youtube", "both", "telegram", "telegram_both")
 
 
 class _ApiError(Exception):
@@ -126,11 +129,13 @@ def _settings_json(config: AppConfig) -> dict[str, Any]:
         "retention_days": config.retention_days,
         "max_concurrent_recordings": config.max_concurrent_recordings,
         "max_concurrent_youtube_streams": config.max_concurrent_youtube_streams,
+        "max_concurrent_telegram_streams": config.max_concurrent_telegram_streams,
         "record_chat": config.record_chat,
         "kick_record_chat": config.kick.record_chat,
         "youtube": {
             "privacy_status": config.youtube.privacy_status,
             "hold_seconds": config.youtube.hold_seconds,
+            "max_broadcast_hours": config.youtube.max_broadcast_hours,
         },
         "disk": {
             "max_total_gb": config.disk.max_total_gb,
@@ -199,7 +204,7 @@ def _switch(value: Any, key: str) -> str:
 def _mode(value: Any) -> str:
     """Validated output mode, or 'default' to clear a per-channel override."""
     if not isinstance(value, str) or value.lower() not in _OUTPUT_MODES:
-        msg = "output_mode must be one of disk, youtube, both, default"
+        msg = "output_mode must be one of disk, youtube, both, telegram, telegram_both, default"
         raise _ApiError(400, msg)
     return value.lower()
 
@@ -211,7 +216,7 @@ def _global_mode(value: Any) -> str:
     as the global mode, so this method rejects it.
     """
     if not isinstance(value, str) or value.lower() not in _GLOBAL_OUTPUT_MODES:
-        msg = "output_mode must be one of disk, youtube, both"
+        msg = "output_mode must be one of disk, youtube, both, telegram, telegram_both"
         raise _ApiError(400, msg)
     return value.lower()
 
@@ -267,6 +272,18 @@ def _global_hold_seconds(value: Any) -> str:
         msg = "youtube_hold_seconds must be a whole number of seconds >= 0"
         raise _ApiError(400, msg)
     return str(int(value))
+
+
+def _hours(value: Any, key: str) -> str:
+    """Validated hours: a finite number >= 0, or text like 11:50 or 11h50m."""
+    if isinstance(value, str):
+        parsed = parse_hours(value)
+        if parsed is not None:
+            value = parsed
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0:
+        msg = f"{key} must be hours >= 0 (a number, or text like 11:50 or 11h50m)"
+        raise _ApiError(400, msg)
+    return str(value)
 
 
 def _vod_upload(value: Any) -> str:
@@ -563,6 +580,8 @@ class ControlAPI:
             return await self._run(ctrl.handle_maxrecordings, [_scalar(value, key)])
         if key == "max_concurrent_youtube_streams":
             return await self._run(ctrl.handle_maxyoutube, [_scalar(value, key)])
+        if key == "max_concurrent_telegram_streams":
+            return await self._run(ctrl.handle_maxtelegram, [_scalar(value, key)])
         if key == "record_chat":
             return await self._run(ctrl.handle_chat, [_switch(value, key), "twitch"])
         if key == "kick_record_chat":
@@ -573,6 +592,8 @@ class ControlAPI:
             return await self._run(ctrl.handle_disk, ["delete_oldest", _switch(value, key)])
         if key == "youtube_hold_seconds":
             return await self._run(ctrl.handle_global_hold, [_global_hold_seconds(value)])
+        if key == "youtube_max_broadcast_hours":
+            return await self._run(ctrl.handle_split_hours, [_hours(value, key)])
         if key == "endpoint_enabled":
             return await self._apply_endpoint_enabled(_switch(value, key) == "on")
         if key == "endpoint_public_url":
