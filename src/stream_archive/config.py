@@ -20,6 +20,7 @@ from pydantic import (
     PositiveFloat,
     PrivateAttr,
     StrictBool,
+    StrictFloat,
     StrictInt,
     StrictStr,
     field_validator,
@@ -481,6 +482,24 @@ class TelegramLiveConfig(BaseModel):
         return self
 
 
+class RecordingClaim(BaseModel):
+    """One finished stream segment that may still get a recording.
+
+    A Saved Messages recording carries no channel name, so the app
+    matches it by duration. A segment that ended recently and has a
+    near-equal duration makes another channel's pick ambiguous. The
+    app stores claims for 30 minutes past the end and then drops
+    them. The store survives restarts, which is when mass segment
+    ends happen.
+    """
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    channel: StrictStr
+    duration_s: StrictFloat = Field(ge=0)
+    ended_at: StrictInt = Field(ge=0)
+
+
 class AppConfig(BaseModel):
     """Typed, validated view of config.json.
 
@@ -527,6 +546,9 @@ class AppConfig(BaseModel):
     #: that tells two deliveries apart, so a stored one never forwards
     #: again. The app trims the list to the newest 200.
     telegram_forwarded_recording_keys: list[StrictStr] = []
+    #: Recent stream segments that may still get a Saved Messages
+    #: recording. The app maintains this list; see RecordingClaim.
+    telegram_recording_claims: list[RecordingClaim] = []
     channel_preferred_qualities: dict[str, str] = {}
     channel_categories: dict[str, list[str]] = {}
     youtube: YouTubeConfig = YouTubeConfig()

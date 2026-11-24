@@ -381,18 +381,60 @@ def test_forward_recording_ignores_files_that_landed_before_the_end(tmp_path):
 
 
 def test_forward_recording_leaves_an_ambiguous_file_to_neither_channel(tmp_path):
-    streamer, client, _cfg = make_streamer(tmp_path, channel_telegram_peers={"a": -100777, "b": -100888})
+    ended = 1_800_000_000
+    streamer, client, _cfg = make_streamer(
+        tmp_path,
+        channel_telegram_peers={"a": -100777, "b": -100888},
+        telegram_recording_claims=[{"channel": "twitch:b", "duration_s": 102.0, "ended_at": ended}],
+    )
     client.saved_messages = [_saved_recording(9, duration=100.0, size=1000)]
-    # Another channel is already waiting for a recording of the same
-    # length: the one file on hand matches both claims, so it is
-    # ambiguous and must go to neither.
-    streamer._forward_claims["twitch:b"] = (102.0, None)
 
+    # Another channel ended a segment of the same length half a minute
+    # ago: the one file on hand matches both, so it is ambiguous and
+    # must go to neither, even though that channel's wait is over.
     async def scenario():
-        return await streamer.forward_recording("twitch:a", 7, expected_duration_s=100.0, timeout_s=0, poll_s=0.01)
+        return await streamer.forward_recording(
+            "twitch:a", 7, expected_duration_s=100.0, ended_at=float(ended), timeout_s=0, poll_s=0.01
+        )
 
     assert asyncio.run(scenario()) is None
     assert client.forwarded == []
+
+
+def test_forward_recording_ignores_a_stale_claim(tmp_path):
+    ended = 1_800_000_000
+    streamer, client, _cfg = make_streamer(
+        tmp_path,
+        channel_telegram_peers={"a": -100777, "b": -100888},
+        telegram_recording_claims=[{"channel": "twitch:b", "duration_s": 102.0, "ended_at": ended - 7200}],
+    )
+    client.saved_messages = [_saved_recording(9, duration=100.0, size=1000)]
+
+    async def scenario():
+        return await streamer.forward_recording(
+            "twitch:a", 7, expected_duration_s=100.0, ended_at=float(ended), timeout_s=1, poll_s=0.01
+        )
+
+    assert asyncio.run(scenario()) is not None
+    assert client.forwarded == [(("input-peer", -100777), 9, "me")]
+
+
+def test_forward_recording_registers_its_segment_as_a_claim(tmp_path):
+    ended = 1_800_000_000
+    streamer, client, cfg = make_streamer(tmp_path, channel_telegram_peers={"ch": -100777})
+    client.saved_messages = [_saved_recording(9, duration=100.0, size=1000)]
+
+    async def scenario():
+        return await streamer.forward_recording(
+            "twitch:ch", 7, expected_duration_s=100.0, ended_at=float(ended), timeout_s=1, poll_s=0.01
+        )
+
+    assert asyncio.run(scenario()) is not None
+    claims = cfg.telegram_recording_claims
+    assert [(c.channel, c.duration_s, c.ended_at) for c in claims] == [("twitch:ch", 100.0, ended)]
+    assert read_file(tmp_path)["telegram_recording_claims"] == [
+        {"channel": "twitch:ch", "duration_s": 100.0, "ended_at": ended}
+    ]
 
 
 def test_post_chat_log_skips_an_unmapped_channel(tmp_path):
