@@ -72,6 +72,7 @@ Keys marked **hand edit** stay read-only over the Telegram bot, the web panel, a
 | `telegram_live.post_chat_log` | no | `true` | Post the finished chat log file to the Telegram channel when a restream ends. Needs `record_chat` |
 | `telegram_live.forward_recording` | no | `true` | Forward the server-side recording from Saved Messages to the Telegram channel after the stream ends, and notify the operator with its link. Needs `telegram_live.record` |
 | `channel_telegram_icon_urls` | no | `{}` | Monitored channel -> profile image URL last set as the Telegram channel photo. The app maintains this; a hand edit forces a re-set at the next stream |
+| `telegram_forwarded_recording_keys` | no | `[]` | Fingerprints (`<size>:<duration>`) of Saved Messages recordings already forwarded to a channel. The app maintains this; a stored fingerprint never forwards again |
 | `disk.max_total_gb` | no | `0` | Delete the oldest archive files when the total exceeds this size in GB. `0` disables the cap |
 | `disk.check_interval_s` | no, hand edit | `60` | Seconds between disk watchdog checks |
 | `disk.delete_oldest` | no | `true` | On a breach, delete the oldest archive files. `false` stops new recordings instead |

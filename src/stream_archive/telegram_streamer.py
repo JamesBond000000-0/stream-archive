@@ -40,6 +40,33 @@ _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 _JPEG_MAGIC = b"\xff\xd8\xff"
 
 
+def _duration_tolerance(expected_s: float) -> float:
+    """How far a recording's duration may sit from its stream segment.
+
+    The server recording starts a little after the stream and stops
+    with the call, so it runs shorter than the segment. Long segments
+    drift more, hence the percentage.
+    """
+    return max(60.0, expected_s * 0.10)
+
+
+def _message_duration(msg: Any) -> float | None:
+    """Duration in seconds of a message's media, from its document attributes."""
+    doc = getattr(msg, "document", None)
+    if doc is None:
+        return None
+    for attr in getattr(doc, "attributes", None) or []:
+        duration = getattr(attr, "duration", None)
+        if isinstance(duration, int | float):
+            return float(duration)
+    return None
+
+
+def _recording_fingerprint(size: int, duration: float) -> str:
+    """Identity of one recording file: its byte size and whole-second duration."""
+    return f"{size}:{round(duration)}"
+
+
 async def _download_image(url: str) -> bytes | None:
     """Fetch one image. None on any failure: icons are best effort."""
     try:
@@ -158,6 +185,13 @@ class TelegramLiveStreamer:
         self._profile_image_resolver = profile_image_resolver
         self._client: Any = None
         self._lock = asyncio.Lock()
+        #: Serializes recording picks, so two finishing streams cannot
+        #: claim the same Saved Messages file in the same round.
+        self._forward_lock = asyncio.Lock()
+        #: channel -> (expected duration, end time) of the forwards now
+        #: waiting. A candidate that matches two channels at once is
+        #: ambiguous and goes to neither.
+        self._forward_claims: dict[str, tuple[float | None, float | None]] = {}
         #: Serializes channel creates, so two first-time channels cannot
         #: race the config save or hit the create rate limit together.
         self._create_lock = asyncio.Lock()
@@ -434,15 +468,38 @@ class TelegramLiveStreamer:
         return latest if isinstance(latest, int) else None
 
     async def forward_recording(
-        self, channel: str, baseline_id: int, *, timeout_s: float = 600.0, poll_s: float = 20.0
+        self,
+        channel: str,
+        baseline_id: int,
+        *,
+        expected_duration_s: float | None = None,
+        ended_at: float | None = None,
+        timeout_s: float = 600.0,
+        poll_s: float = 20.0,
     ) -> dict[str, Any] | None:
         """Forward this stream's recording from Saved Messages to the channel.
 
         Saved Messages has no shareable link, so the forwarded post is
         the archive: it lives in the channel and has a channel link.
-        The recording is the first media message newer than
-        baseline_id (the newest Saved Messages id when the recording
-        started). Polls until it appears or the timeout passes; None
+
+        A recording message carries no channel name, no title, and no
+        call id: the file is always record.mp4 (plus a record.ogg
+        audio twin). The only signals are its duration, its size, and
+        when it landed, so the pick is strict:
+
+        - video files only, never the audio twin,
+        - newer than baseline_id and landed no earlier than the
+          stream's end (a small slack covers processing order),
+        - duration within max(60 s, 10%) of the stream segment,
+        - not forwarded before: Telegram can deliver one recording
+          several times, and the (size, duration) fingerprint stored
+          in telegram_forwarded_recording_keys is what tells the
+          copies apart from new recordings,
+        - not ambiguous: a candidate that also matches another
+          channel's waiting claim goes to neither. A wrong archive
+          is worse than a missing one.
+
+        Polls until a candidate qualifies or the timeout passes; None
         on timeout or when the channel has no mapped peer.
         """
         peer_id = self._config.channel_telegram_peers.get(channel)
@@ -450,28 +507,105 @@ class TelegramLiveStreamer:
             return None
         client = await self.connect()
         input_peer = await client.get_input_entity(peer_id)
+        claim = (expected_duration_s, ended_at)
+        self._forward_claims[channel] = claim
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
-        while True:
-            msgs = await client.get_messages("me", limit=10)
-            candidates = [
-                m
-                for m in msgs or []
-                if isinstance(getattr(m, "id", None), int) and m.id > baseline_id and getattr(m, "media", None)
-            ]
-            if candidates:
-                msg = min(candidates, key=lambda m: m.id)
-                sent = await client.forward_messages(input_peer, messages=msg.id, from_peer="me")
-                first = sent[0] if isinstance(sent, list) else sent
-                post_id = getattr(first, "id", None)
-                raw_id = str(peer_id).removeprefix("-100")
-                url = f"https://t.me/c/{raw_id}/{post_id}" if isinstance(post_id, int) else f"https://t.me/c/{raw_id}"
-                logger.info("[telegram_live] Forwarded the recording of %s to Telegram channel %s", channel, peer_id)
-                return {"message_id": post_id, "telegram_url": url}
-            if loop.time() >= deadline:
-                logger.warning("[telegram_live] No recording arrived in Saved Messages for %s", channel)
-                return None
-            await asyncio.sleep(poll_s)
+        try:
+            while True:
+                async with self._forward_lock:
+                    msgs = await client.get_messages("me", limit=30)
+                    pick = self._pick_recording(msgs, channel, baseline_id, expected_duration_s, ended_at)
+                    if pick is not None:
+                        msg, fingerprint = pick
+                        sent = await client.forward_messages(input_peer, messages=msg.id, from_peer="me")
+                        self._store_forwarded_key(fingerprint)
+                        first = sent[0] if isinstance(sent, list) else sent
+                        post_id = getattr(first, "id", None)
+                        raw_id = str(peer_id).removeprefix("-100")
+                        url = (
+                            f"https://t.me/c/{raw_id}/{post_id}"
+                            if isinstance(post_id, int)
+                            else f"https://t.me/c/{raw_id}"
+                        )
+                        logger.info(
+                            "[telegram_live] Forwarded the recording of %s to Telegram channel %s", channel, peer_id
+                        )
+                        return {"message_id": post_id, "telegram_url": url}
+                if loop.time() >= deadline:
+                    logger.warning("[telegram_live] No recording matched in Saved Messages for %s", channel)
+                    return None
+                await asyncio.sleep(poll_s)
+        finally:
+            if self._forward_claims.get(channel) == claim:
+                del self._forward_claims[channel]
+
+    def _pick_recording(
+        self,
+        msgs: Any,
+        channel: str,
+        baseline_id: int,
+        expected_duration_s: float | None,
+        ended_at: float | None,
+    ) -> tuple[Any, str] | None:
+        """Best claimable recording message in one Saved Messages page, or None.
+
+        Returns the message and its (size, duration) fingerprint. The
+        rules are the ones in forward_recording's docstring.
+        """
+        consumed = set(self._config.telegram_forwarded_recording_keys)
+        best: tuple[float, int, Any, str] | None = None
+        for msg in msgs or []:
+            msg_id = getattr(msg, "id", None)
+            if not isinstance(msg_id, int) or msg_id <= baseline_id:
+                continue
+            doc = getattr(msg, "document", None)
+            mime = getattr(doc, "mime_type", None) if doc is not None else None
+            if not isinstance(mime, str) or not mime.startswith("video/"):
+                continue
+            size = getattr(doc, "size", None)
+            duration = _message_duration(msg)
+            if not isinstance(size, int) or duration is None:
+                continue
+            fingerprint = _recording_fingerprint(size, duration)
+            if fingerprint in consumed:
+                continue
+            if ended_at is not None:
+                landed = getattr(msg, "date", None)
+                landed_ts = landed.timestamp() if landed is not None else None
+                if landed_ts is not None and landed_ts < ended_at - 60:
+                    continue
+            score = 0.0
+            if expected_duration_s is not None:
+                if abs(duration - expected_duration_s) > _duration_tolerance(expected_duration_s):
+                    continue
+                ambiguous = any(
+                    other != channel
+                    and other_duration is not None
+                    and abs(duration - other_duration) <= _duration_tolerance(other_duration)
+                    for other, (other_duration, _other_end) in self._forward_claims.items()
+                )
+                if ambiguous:
+                    continue
+                score = abs(duration - expected_duration_s)
+            # Closest duration wins; a tie goes to the earliest
+            # delivery, which is the original, not a later copy.
+            if best is None or (score, msg_id) < (best[0], best[1]):
+                best = (score, msg_id, msg, fingerprint)
+        if best is None:
+            return None
+        return best[2], best[3]
+
+    def _store_forwarded_key(self, fingerprint: str) -> None:
+        """Record one forwarded recording fingerprint in the config."""
+
+        def store(cfg: AppConfig) -> None:
+            keys = cfg.telegram_forwarded_recording_keys
+            if fingerprint not in keys:
+                keys.append(fingerprint)
+                del keys[:-200]
+
+        apply_config_change(self._config, store)
 
     async def end_stream(self, telegram_info: dict[str, Any]) -> None:
         """End one live stream. Raises on failure: the caller logs it."""
