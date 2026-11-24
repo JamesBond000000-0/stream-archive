@@ -521,6 +521,12 @@ class AppConfig(BaseModel):
     #: channel photo. The streamer compares it with the live URL at each
     #: stream start, so a new broadcaster icon is picked up once.
     channel_telegram_icon_urls: dict[str, StrictStr] = {}
+    #: Fingerprints ("<size>:<duration>") of Saved Messages recordings
+    #: already forwarded to a channel. Telegram can deliver one
+    #: recording more than once, and the fingerprint is the only thing
+    #: that tells two deliveries apart, so a stored one never forwards
+    #: again. The app trims the list to the newest 200.
+    telegram_forwarded_recording_keys: list[StrictStr] = []
     channel_preferred_qualities: dict[str, str] = {}
     channel_categories: dict[str, list[str]] = {}
     youtube: YouTubeConfig = YouTubeConfig()

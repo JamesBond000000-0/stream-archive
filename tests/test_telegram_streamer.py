@@ -304,20 +304,28 @@ def test_create_stream_with_record_stores_the_saved_messages_baseline(tmp_path):
     assert info["record_baseline_id"] == 7
 
 
-def test_forward_recording_forwards_the_first_media_after_the_baseline(tmp_path):
-    streamer, client, _cfg = make_streamer(tmp_path, channel_telegram_peers={"ch": -100777})
+def _saved_recording(msg_id, *, duration=100.0, size=1000, mime="video/mp4", landed=None):
+    """One Saved Messages message in the shape a recording lands in."""
+    doc = types.SimpleNamespace(mime_type=mime, size=size, attributes=[types.SimpleNamespace(duration=duration)])
+    return types.SimpleNamespace(id=msg_id, media=object(), document=doc, date=landed)
+
+
+def test_forward_recording_forwards_the_matching_video(tmp_path):
+    streamer, client, cfg = make_streamer(tmp_path, channel_telegram_peers={"ch": -100777})
     client.saved_messages = [
-        types.SimpleNamespace(id=8, media=None),
-        types.SimpleNamespace(id=9, media=object()),
-        types.SimpleNamespace(id=10, media=object()),
+        _saved_recording(8, mime="audio/ogg", size=900),  # the audio twin: never forwarded
+        _saved_recording(9, duration=100.0, size=1000),
+        _saved_recording(10, duration=400.0, size=2000),  # another stream's recording
     ]
 
     async def scenario():
-        return await streamer.forward_recording("twitch:ch", 7, timeout_s=1, poll_s=0.01)
+        return await streamer.forward_recording("twitch:ch", 7, expected_duration_s=100.0, timeout_s=1, poll_s=0.01)
 
     result = asyncio.run(scenario())
     assert result == {"message_id": 9001, "telegram_url": "https://t.me/c/777/9001"}
     assert client.forwarded == [(("input-peer", -100777), 9, "me")]
+    assert cfg.telegram_forwarded_recording_keys == ["1000:100"]
+    assert read_file(tmp_path)["telegram_forwarded_recording_keys"] == ["1000:100"]
 
 
 def test_forward_recording_times_out_without_a_recording(tmp_path):
@@ -326,6 +334,62 @@ def test_forward_recording_times_out_without_a_recording(tmp_path):
 
     async def scenario():
         return await streamer.forward_recording("twitch:ch", 7, timeout_s=0, poll_s=0.01)
+
+    assert asyncio.run(scenario()) is None
+    assert client.forwarded == []
+
+
+def test_forward_recording_rejects_a_duration_mismatch(tmp_path):
+    streamer, client, _cfg = make_streamer(tmp_path, channel_telegram_peers={"ch": -100777})
+    client.saved_messages = [_saved_recording(9, duration=900.0, size=5000)]
+
+    async def scenario():
+        return await streamer.forward_recording("twitch:ch", 7, expected_duration_s=100.0, timeout_s=0, poll_s=0.01)
+
+    assert asyncio.run(scenario()) is None
+    assert client.forwarded == []
+
+
+def test_forward_recording_skips_an_already_forwarded_file(tmp_path):
+    streamer, client, _cfg = make_streamer(
+        tmp_path, channel_telegram_peers={"ch": -100777}, telegram_forwarded_recording_keys=["1000:100"]
+    )
+    # A second delivery of the same recording: same size and duration.
+    client.saved_messages = [_saved_recording(9, duration=100.0, size=1000)]
+
+    async def scenario():
+        return await streamer.forward_recording("twitch:ch", 7, expected_duration_s=100.0, timeout_s=0, poll_s=0.01)
+
+    assert asyncio.run(scenario()) is None
+    assert client.forwarded == []
+
+
+def test_forward_recording_ignores_files_that_landed_before_the_end(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    streamer, client, _cfg = make_streamer(tmp_path, channel_telegram_peers={"ch": -100777})
+    ended = datetime(2026, 11, 24, 5, 0, tzinfo=UTC)
+    client.saved_messages = [_saved_recording(9, duration=100.0, landed=ended - timedelta(hours=1))]
+
+    async def scenario():
+        return await streamer.forward_recording(
+            "twitch:ch", 7, expected_duration_s=100.0, ended_at=ended.timestamp(), timeout_s=0, poll_s=0.01
+        )
+
+    assert asyncio.run(scenario()) is None
+    assert client.forwarded == []
+
+
+def test_forward_recording_leaves_an_ambiguous_file_to_neither_channel(tmp_path):
+    streamer, client, _cfg = make_streamer(tmp_path, channel_telegram_peers={"a": -100777, "b": -100888})
+    client.saved_messages = [_saved_recording(9, duration=100.0, size=1000)]
+    # Another channel is already waiting for a recording of the same
+    # length: the one file on hand matches both claims, so it is
+    # ambiguous and must go to neither.
+    streamer._forward_claims["twitch:b"] = (102.0, None)
+
+    async def scenario():
+        return await streamer.forward_recording("twitch:a", 7, expected_duration_s=100.0, timeout_s=0, poll_s=0.01)
 
     assert asyncio.run(scenario()) is None
     assert client.forwarded == []

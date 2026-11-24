@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import time
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
@@ -93,17 +94,26 @@ class TelegramOutputMixin:
         baseline = telegram_info.get("record_baseline_id")
         if not isinstance(baseline, int) or self._telegram is None:
             return
-        task = asyncio.create_task(self._forward_recording(channel, entry, baseline))
+        # The segment length and the end time are the only signals
+        # that can tie a Saved Messages file to this stream: the
+        # streamer matches the recording against both.
+        started_at = entry.get("started_at")
+        duration_s = time.monotonic() - started_at if isinstance(started_at, int | float) else None
+        task = asyncio.create_task(self._forward_recording(channel, entry, baseline, duration_s, time.time()))
         self._post_tasks.add(task)
         task.add_done_callback(self._post_tasks.discard)
 
-    async def _forward_recording(self, channel: str, entry: Recording, baseline_id: int) -> None:
+    async def _forward_recording(
+        self, channel: str, entry: Recording, baseline_id: int, duration_s: float | None, ended_at: float
+    ) -> None:
         """Forward the recording, then tell the operator its link. Never raises."""
         telegram = self._telegram
         if telegram is None:
             return
         try:
-            result = await telegram.forward_recording(channel, baseline_id)
+            result = await telegram.forward_recording(
+                channel, baseline_id, expected_duration_s=duration_s, ended_at=ended_at
+            )
         except Exception:
             logger.error("[recorder] [telegram] Recording forward failed for %s", channel, exc_info=True)
             return

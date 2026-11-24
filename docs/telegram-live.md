@@ -61,6 +61,8 @@ When a Telegram restream ends and `telegram_live.post_chat_log` is on (the defau
 
 With `telegram_live.record` on, the server-side recording lands in the account's Saved Messages after the stream ends. Saved Messages has no shareable link, so with `telegram_live.forward_recording` on (the default) the app forwards the file to the channel once it arrives (polling up to 10 minutes). The forwarded post is the archive copy, and its channel link goes to the operator notification.
 
+A recording message carries no channel name or title, so the app matches it strictly: video file only (each recording also drops an audio-only twin), duration within max(60 s, 10%) of the stream segment, landed after the stream ended, and never forwarded before (Telegram can deliver one recording several times; the app stores each forwarded file's size-and-duration fingerprint in `telegram_forwarded_recording_keys`). A file that matches two waiting channels at once goes to neither: a missing archive is better than another channel's recording in the wrong channel.
+
 Public channels (with a `@username`) have a small per-account cap, so auto-create makes private channels. Join them with an invite link from the Telegram app.
 
 To use a channel that exists already, add its peer id by hand and turn auto-create off if you want a missing entry to fail instead of creating a channel.

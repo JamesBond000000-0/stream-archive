@@ -3273,6 +3273,7 @@ class FakeTelegramStreamer:
         self.ended = []
         self.chat_logs = []
         self.forwards = []
+        self.forward_kwargs = []
 
     async def create_stream(self, author, title, channel, game):
         if self.create_error:
@@ -3292,8 +3293,9 @@ class FakeTelegramStreamer:
         self.chat_logs.append((channel, file_path, caption))
         return True
 
-    async def forward_recording(self, channel, baseline_id):
+    async def forward_recording(self, channel, baseline_id, *, expected_duration_s=None, ended_at=None):
         self.forwards.append((channel, baseline_id))
+        self.forward_kwargs.append({"expected_duration_s": expected_duration_s, "ended_at": ended_at})
         return {"message_id": 5, "telegram_url": "https://t.me/c/777/5"}
 
 

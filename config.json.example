@@ -23,6 +23,7 @@
     "channel_youtube_vod_upload": {},
     "channel_telegram_peers": {},
     "channel_telegram_icon_urls": {},
+    "telegram_forwarded_recording_keys": [],
     "channel_preferred_qualities": {},
     "channel_categories": {},
     "eventsub": {
