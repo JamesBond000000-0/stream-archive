@@ -70,7 +70,8 @@
         "auto_create_channels": true,
         "record": false,
         "title_timestamp": true,
-        "post_chat_log": true
+        "post_chat_log": true,
+        "forward_recording": true
     },
     "retention_days": 0,
     "preferred_quality": "best",

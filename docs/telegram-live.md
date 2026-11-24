@@ -27,7 +27,8 @@ The account must own or manage each target channel. One Telegram channel can hol
        "auto_create_channels": true,
        "record": false,
        "title_timestamp": true,
-       "post_chat_log": true
+       "post_chat_log": true,
+       "forward_recording": true
    }
    ```
 
@@ -57,6 +58,8 @@ At each stream start the app sets the Telegram channel photo to the broadcaster'
 The live stream title is `author - title`, plus the start time in the app timezone when `telegram_live.title_timestamp` is on (the default): `author - title (2026-11-24 12:31 JST)`.
 
 When a Telegram restream ends and `telegram_live.post_chat_log` is on (the default), the finished chat log file is posted to the channel. This needs `record_chat`: without a chat file there is nothing to post.
+
+With `telegram_live.record` on, the server-side recording lands in the account's Saved Messages after the stream ends. Saved Messages has no shareable link, so with `telegram_live.forward_recording` on (the default) the app forwards the file to the channel once it arrives (polling up to 10 minutes). The forwarded post is the archive copy, and its channel link goes to the operator notification.
 
 Public channels (with a `@username`) have a small per-account cap, so auto-create makes private channels. Join them with an invite link from the Telegram app.
 

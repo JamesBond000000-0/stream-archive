@@ -34,6 +34,8 @@ class FakeTelethonClient:
         self.requests = []
         self.sent_files = []
         self.uploads = []
+        self.saved_messages = []
+        self.forwarded = []
         self.authorized = True
         self.disconnected = False
 
@@ -60,6 +62,14 @@ class FakeTelethonClient:
     async def send_file(self, entity, file=None, caption=None):
         self.sent_files.append((entity, file, caption))
         return types.SimpleNamespace(id=1)
+
+    async def get_messages(self, entity, limit=None):
+        msgs = sorted(self.saved_messages, key=lambda m: m.id, reverse=True)
+        return msgs[:limit] if limit else msgs
+
+    async def forward_messages(self, entity, messages=None, from_peer=None):
+        self.forwarded.append((entity, messages, from_peer))
+        return types.SimpleNamespace(id=9001)
 
     async def __call__(self, request):
         self.requests.append(request)
@@ -279,6 +289,46 @@ def test_post_chat_log_sends_the_file_to_the_mapped_peer(tmp_path):
 
     assert asyncio.run(scenario()) is True
     assert client.sent_files == [(("input-peer", -100777), "/data/chat.chat.json", "Chat log: Title")]
+
+
+def test_create_stream_with_record_stores_the_saved_messages_baseline(tmp_path):
+    streamer, client, _cfg = make_streamer(
+        tmp_path, channel_telegram_peers={"ch": -100777}, telegram_live={"record": True}
+    )
+    client.saved_messages = [types.SimpleNamespace(id=7, media=None)]
+
+    async def scenario():
+        return await streamer.create_stream("author", "Title", "twitch:ch", "Game")
+
+    info = asyncio.run(scenario())
+    assert info["record_baseline_id"] == 7
+
+
+def test_forward_recording_forwards_the_first_media_after_the_baseline(tmp_path):
+    streamer, client, _cfg = make_streamer(tmp_path, channel_telegram_peers={"ch": -100777})
+    client.saved_messages = [
+        types.SimpleNamespace(id=8, media=None),
+        types.SimpleNamespace(id=9, media=object()),
+        types.SimpleNamespace(id=10, media=object()),
+    ]
+
+    async def scenario():
+        return await streamer.forward_recording("twitch:ch", 7, timeout_s=1, poll_s=0.01)
+
+    result = asyncio.run(scenario())
+    assert result == {"message_id": 9001, "telegram_url": "https://t.me/c/777/9001"}
+    assert client.forwarded == [(("input-peer", -100777), 9, "me")]
+
+
+def test_forward_recording_times_out_without_a_recording(tmp_path):
+    streamer, client, _cfg = make_streamer(tmp_path, channel_telegram_peers={"ch": -100777})
+    client.saved_messages = [types.SimpleNamespace(id=8, media=None)]
+
+    async def scenario():
+        return await streamer.forward_recording("twitch:ch", 7, timeout_s=0, poll_s=0.01)
+
+    assert asyncio.run(scenario()) is None
+    assert client.forwarded == []
 
 
 def test_post_chat_log_skips_an_unmapped_channel(tmp_path):

@@ -32,6 +32,7 @@ class TelegramOutputMixin:
     _telegram: TelegramLiveStreamer | None
     _notifier: Notifier | None
     _recordings: dict[str, Recording]
+    _post_tasks: set[asyncio.Task[Any]]
     # Set by sibling mixins and Recorder (core.py). Exact call shapes so
     # a signature drift fails type checks instead of failing at runtime.
     _track: Callable[[str, Coroutine[Any, Any, Any]], asyncio.Task[Any]]
@@ -78,6 +79,47 @@ class TelegramOutputMixin:
             await telegram.post_chat_log(channel, chat_path, caption)
         except Exception:
             logger.error("[recorder] [telegram] Chat log post failed for %s", channel, exc_info=True)
+
+    def _schedule_recording_forward(self, channel: str, entry: Recording, telegram_info: dict[str, Any]) -> None:
+        """Start the background recording forward for a finished restream.
+
+        The server-side recording lands in Saved Messages some time
+        after the stream ends, so finalize cannot wait for it. The
+        task polls there and forwards the file to the channel.
+        """
+        live = self._config.telegram_live
+        if not (live.record and live.forward_recording):
+            return
+        baseline = telegram_info.get("record_baseline_id")
+        if not isinstance(baseline, int) or self._telegram is None:
+            return
+        task = asyncio.create_task(self._forward_recording(channel, entry, baseline))
+        self._post_tasks.add(task)
+        task.add_done_callback(self._post_tasks.discard)
+
+    async def _forward_recording(self, channel: str, entry: Recording, baseline_id: int) -> None:
+        """Forward the recording, then tell the operator its link. Never raises."""
+        telegram = self._telegram
+        if telegram is None:
+            return
+        try:
+            result = await telegram.forward_recording(channel, baseline_id)
+        except Exception:
+            logger.error("[recorder] [telegram] Recording forward failed for %s", channel, exc_info=True)
+            return
+        if result is None:
+            return
+        if self._notifier is None:
+            return
+        lines = [
+            f"\U0001f4f9 Telegram recording archived for {channel}.",
+            f"Stream: {sanitize_metadata_text(entry.get('title') or 'Unknown')}",
+            f"Recording: {result.get('telegram_url')}",
+        ]
+        try:
+            await self._notifier.notify("\n".join(lines))
+        except Exception:
+            logger.error("[recorder] recording-archive notification failed for %s", channel, exc_info=True)
 
     async def _stream_telegram(
         self,

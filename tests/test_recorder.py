@@ -3272,6 +3272,7 @@ class FakeTelegramStreamer:
         self.create_error = create_error
         self.ended = []
         self.chat_logs = []
+        self.forwards = []
 
     async def create_stream(self, author, title, channel, game):
         if self.create_error:
@@ -3290,6 +3291,10 @@ class FakeTelegramStreamer:
     async def post_chat_log(self, channel, file_path, caption):
         self.chat_logs.append((channel, file_path, caption))
         return True
+
+    async def forward_recording(self, channel, baseline_id):
+        self.forwards.append((channel, baseline_id))
+        return {"message_id": 5, "telegram_url": "https://t.me/c/777/5"}
 
 
 class _StubChatRecorder:
@@ -3346,6 +3351,39 @@ def test_finalize_skips_the_chat_log_when_the_file_is_gone(tmp_path):
 
     asyncio.run(scenario())
     assert streamer.ended and streamer.chat_logs == []
+
+
+def test_finalize_forwards_the_recording_when_recorded(tmp_path):
+    config = make_config(tmp_path)
+    config.output_mode = "telegram"
+    config.telegram_live.record = True
+    streamer = FakeTelegramStreamer()
+    rec = Recorder(config, telegram_streamer=streamer)
+    entry = _telegram_entry()
+    entry["telegram_info"] = {"peer_id": -100777, "call_id": 42, "access_hash": 99, "record_baseline_id": 7}
+
+    async def scenario():
+        await rec._finalize_entry("twitch:ch", entry, None)
+        await asyncio.gather(*rec._post_tasks)
+
+    asyncio.run(scenario())
+    assert streamer.forwards == [("twitch:ch", 7)]
+
+
+def test_finalize_skips_the_recording_forward_when_not_recording(tmp_path):
+    config = make_config(tmp_path)
+    config.output_mode = "telegram"
+    streamer = FakeTelegramStreamer()
+    rec = Recorder(config, telegram_streamer=streamer)
+    entry = _telegram_entry()
+    entry["telegram_info"] = {"peer_id": -100777, "call_id": 42, "access_hash": 99, "record_baseline_id": 7}
+
+    async def scenario():
+        await rec._finalize_entry("twitch:ch", entry, None)
+        await asyncio.gather(*rec._post_tasks)
+
+    asyncio.run(scenario())
+    assert streamer.forwards == []
 
 
 def test_finalize_skips_the_chat_log_when_disabled(tmp_path):

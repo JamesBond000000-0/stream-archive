@@ -100,6 +100,9 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, TelegramOut
         self._notifier = notifier
         self._recordings = {}
         self._locks = {}
+        #: Background finalize follow-ups (the recording forward). The
+        #: set holds the tasks so they are not collected mid-flight.
+        self._post_tasks: set[asyncio.Task[Any]] = set()
         self._session = Streamlink()
         # Short HTTP timeout: a dead playlist proxy must fail over fast
         # instead of burning 30 s per proxy before the recording starts.
@@ -816,6 +819,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, TelegramOut
                 if path and os.path.exists(path):
                     await self._post_chat_log_file(channel, entry, path)
                     break
+            self._schedule_recording_forward(channel, entry, telegram_info)
         if not finish_media:
             return
         await self._remux_finished_file(entry)

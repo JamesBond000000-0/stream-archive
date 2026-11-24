@@ -466,6 +466,12 @@ class TelegramLiveConfig(BaseModel):
     #: Telegram restream ends. Needs record_chat; without a chat file
     #: there is nothing to post.
     post_chat_log: StrictBool = True
+    #: Forward the server-side recording to the Telegram channel when
+    #: it lands in Saved Messages after the stream ends. Needs record;
+    #: the forwarded post is the channel's archive copy and its link
+    #: goes to the operator notification. Saved Messages itself has no
+    #: shareable link.
+    forward_recording: StrictBool = True
 
     @model_validator(mode="after")
     def _require_creds_when_enabled(self) -> TelegramLiveConfig:

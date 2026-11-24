@@ -389,6 +389,7 @@ class TelegramLiveStreamer:
         if not isinstance(call_id, int) or not isinstance(access_hash, int):
             msg = f"Telegram live create for {channel} returned no call id: {result!r}"
             raise RuntimeError(msg)
+        record_baseline_id: int | None = None
         if self._config.telegram_live.record:
             # Best effort: a recording failure must not kill the stream.
             # The file lands in Saved Messages when the stream ends.
@@ -401,17 +402,76 @@ class TelegramLiveStreamer:
                         video_portrait=False,
                     )
                 )
+                # The latest Saved Messages id now: the recording file
+                # is the first media message past it after the end.
+                record_baseline_id = await self._saved_messages_latest_id(client)
             except Exception:
                 logger.warning("[telegram_live] Server recording start failed for %s", channel, exc_info=True)
         raw_id = str(peer_id).removeprefix("-100")
         logger.info("[telegram_live] Live started for %s on Telegram channel %s", channel, peer_id)
-        return {
+        info: dict[str, Any] = {
             "peer_id": peer_id,
             "call_id": call_id,
             "access_hash": access_hash,
             "rtmp_url": join_rtmp_url(url, key),
             "telegram_url": f"https://t.me/c/{raw_id}",
         }
+        if record_baseline_id is not None:
+            info["record_baseline_id"] = record_baseline_id
+        return info
+
+    @staticmethod
+    async def _saved_messages_latest_id(client: Any) -> int | None:
+        """Id of the newest Saved Messages message, or None on failure."""
+        try:
+            msgs = await client.get_messages("me", limit=1)
+        except Exception:
+            logger.warning("[telegram_live] Saved Messages read failed", exc_info=True)
+            return None
+        if not msgs:
+            return 0
+        latest = getattr(msgs[0], "id", None)
+        return latest if isinstance(latest, int) else None
+
+    async def forward_recording(
+        self, channel: str, baseline_id: int, *, timeout_s: float = 600.0, poll_s: float = 20.0
+    ) -> dict[str, Any] | None:
+        """Forward this stream's recording from Saved Messages to the channel.
+
+        Saved Messages has no shareable link, so the forwarded post is
+        the archive: it lives in the channel and has a channel link.
+        The recording is the first media message newer than
+        baseline_id (the newest Saved Messages id when the recording
+        started). Polls until it appears or the timeout passes; None
+        on timeout or when the channel has no mapped peer.
+        """
+        peer_id = self._config.channel_telegram_peers.get(channel)
+        if not peer_id:
+            return None
+        client = await self.connect()
+        input_peer = await client.get_input_entity(peer_id)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while True:
+            msgs = await client.get_messages("me", limit=10)
+            candidates = [
+                m
+                for m in msgs or []
+                if isinstance(getattr(m, "id", None), int) and m.id > baseline_id and getattr(m, "media", None)
+            ]
+            if candidates:
+                msg = min(candidates, key=lambda m: m.id)
+                sent = await client.forward_messages(input_peer, messages=msg.id, from_peer="me")
+                first = sent[0] if isinstance(sent, list) else sent
+                post_id = getattr(first, "id", None)
+                raw_id = str(peer_id).removeprefix("-100")
+                url = f"https://t.me/c/{raw_id}/{post_id}" if isinstance(post_id, int) else f"https://t.me/c/{raw_id}"
+                logger.info("[telegram_live] Forwarded the recording of %s to Telegram channel %s", channel, peer_id)
+                return {"message_id": post_id, "telegram_url": url}
+            if loop.time() >= deadline:
+                logger.warning("[telegram_live] No recording arrived in Saved Messages for %s", channel)
+                return None
+            await asyncio.sleep(poll_s)
 
     async def end_stream(self, telegram_info: dict[str, Any]) -> None:
         """End one live stream. Raises on failure: the caller logs it."""
