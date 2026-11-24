@@ -15,16 +15,82 @@ app creates a private channel for it and stores its peer id at once.
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import secrets
-from collections.abc import Callable
+import tempfile
+from collections.abc import Awaitable, Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
+
+import httpx
 
 from stream_archive.config import AppConfig, apply_config_change, bare_name, channel_url
 from stream_archive.recorder.common import sanitize_metadata_text
 
 logger = logging.getLogger(__name__)
+
+#: Profile images come from the platforms' CDNs. Anything larger is not
+#: a channel icon, so the download stops there.
+_MAX_ICON_BYTES = 8 * 1024 * 1024
+
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+_JPEG_MAGIC = b"\xff\xd8\xff"
+
+
+async def _download_image(url: str) -> bytes | None:
+    """Fetch one image. None on any failure: icons are best effort."""
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as http:
+            resp = await http.get(url)
+            resp.raise_for_status()
+            data = resp.content
+    except Exception:
+        logger.warning("[telegram_live] Icon download failed: %s", url, exc_info=True)
+        return None
+    if not data or len(data) > _MAX_ICON_BYTES:
+        logger.warning("[telegram_live] Icon download has a bad size (%d bytes): %s", len(data), url)
+        return None
+    return data
+
+
+async def _as_png_or_jpeg(data: bytes) -> bytes | None:
+    """Image bytes in a format Telegram accepts as a channel photo.
+
+    Telegram profile photos take JPEG or PNG. Twitch serves PNG, Kick
+    serves WebP, so anything else goes through ffmpeg once. None when
+    the bytes are not a convertible image.
+    """
+    if data.startswith(_PNG_MAGIC) or data.startswith(_JPEG_MAGIC):
+        return data
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "icon.src"
+            dst = Path(tmp) / "icon.png"
+            src.write_bytes(data)
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(src),
+                "-frames:v",
+                "1",
+                str(dst),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            if proc.returncode != 0 or not dst.exists():
+                return None
+            return dst.read_bytes()
+    except Exception:
+        logger.warning("[telegram_live] Icon conversion failed", exc_info=True)
+        return None
+
 
 #: Message that names the fix when the user session is missing or dead.
 SETUP_HINT = "Run 'stream-archive-setup-telegram-live' first to log in the Telegram user account."
@@ -81,14 +147,28 @@ def _channel_from_result(result: Any) -> Any:
 class TelegramLiveStreamer:
     """MTProto client for Telegram live streams, logged in as a user."""
 
-    def __init__(self, config: AppConfig, client_factory: Callable[..., Any] | None = None) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        client_factory: Callable[..., Any] | None = None,
+        profile_image_resolver: Callable[[str], Awaitable[str | None]] | None = None,
+    ) -> None:
         self._config = config
         self._client_factory = client_factory
+        self._profile_image_resolver = profile_image_resolver
         self._client: Any = None
         self._lock = asyncio.Lock()
         #: Serializes channel creates, so two first-time channels cannot
         #: race the config save or hit the create rate limit together.
         self._create_lock = asyncio.Lock()
+
+    def set_profile_image_resolver(self, resolver: Callable[[str], Awaitable[str | None]] | None) -> None:
+        """Set the channel -> profile image URL lookup used for channel photos.
+
+        The scheduler builds the platform APIs after the streamer, so it
+        hands the resolver over once they exist.
+        """
+        self._profile_image_resolver = resolver
 
     @property
     def enabled(self) -> bool:
@@ -213,6 +293,65 @@ class TelegramLiveStreamer:
             logger.info("[telegram_live] Created Telegram channel %s for %s", peer, channel)
             return peer
 
+    async def _apply_channel_icon(self, channel: str, peer_id: int) -> None:
+        """Set the Telegram channel photo from the broadcaster's icon. Never raises.
+
+        The resolver answers the current profile image URL of the
+        source channel. The URL last applied is stored in the config,
+        so the photo is set once per icon: at the first stream, and
+        again only when the broadcaster changes their icon.
+        """
+        resolver = self._profile_image_resolver
+        if resolver is None:
+            return
+        try:
+            url = await resolver(channel)
+        except Exception:
+            logger.warning("[telegram_live] Icon lookup failed for %s", channel, exc_info=True)
+            return
+        if not url or self._config.channel_telegram_icon_urls.get(channel) == url:
+            return
+        data = await _download_image(url)
+        if data is None:
+            return
+        data = await _as_png_or_jpeg(data)
+        if data is None:
+            logger.warning("[telegram_live] Icon for %s is not a usable image", channel)
+            return
+        try:
+            client = await self.connect()
+            from telethon.tl.functions.channels import EditPhotoRequest
+            from telethon.tl.types import InputChatUploadedPhoto  # type: ignore[import-untyped]
+
+            input_peer = await client.get_input_entity(peer_id)
+            uploaded = await client.upload_file(io.BytesIO(data), file_name="icon.png")
+            await client(EditPhotoRequest(channel=input_peer, photo=InputChatUploadedPhoto(file=uploaded)))
+        except Exception:
+            logger.warning("[telegram_live] Icon set failed for %s", channel, exc_info=True)
+            return
+
+        def store(cfg: AppConfig) -> None:
+            cfg.channel_telegram_icon_urls[channel] = url
+
+        apply_config_change(self._config, store)
+        logger.info("[telegram_live] Set channel photo for %s from %s", channel, url)
+
+    async def post_chat_log(self, channel: str, file_path: str, caption: str) -> bool:
+        """Post one finished chat log file to the channel. False when skipped.
+
+        Skips when the channel has no mapped Telegram channel: a chat
+        log alone never creates one. Raises on a send failure, like
+        end_stream: the caller logs it.
+        """
+        peer_id = self._config.channel_telegram_peers.get(channel)
+        if not peer_id:
+            return False
+        client = await self.connect()
+        input_peer = await client.get_input_entity(peer_id)
+        await client.send_file(input_peer, file=file_path, caption=sanitize_metadata_text(caption, limit=1024))
+        logger.info("[telegram_live] Posted chat log for %s to Telegram channel %s", channel, peer_id)
+        return True
+
     async def create_stream(self, author: str, title: str, channel: str, game: str) -> dict[str, Any]:
         """Start a live stream for one monitored channel.
 
@@ -221,12 +360,13 @@ class TelegramLiveStreamer:
         """
         client = await self.connect()
         peer_id = await self.ensure_destination(channel)
+        await self._apply_channel_icon(channel, peer_id)
         from telethon.tl.functions.phone import (  # type: ignore[import-untyped]
             CreateGroupCallRequest,
             GetGroupCallStreamRtmpUrlRequest,
             ToggleGroupCallRecordRequest,
         )
-        from telethon.tl.types import InputGroupCall  # type: ignore[import-untyped]
+        from telethon.tl.types import InputGroupCall
 
         input_peer = await client.get_input_entity(peer_id)
         rtmp = await client(GetGroupCallStreamRtmpUrlRequest(peer=input_peer, revoke=False))
@@ -235,7 +375,11 @@ class TelegramLiveStreamer:
         if not isinstance(url, str) or not isinstance(key, str) or not url or not key:
             msg = f"Telegram returned no RTMP address for {channel}: {rtmp!r}"
             raise RuntimeError(msg)
-        live_title = sanitize_metadata_text(f"{author} - {title}", limit=200)
+        live_title = f"{author} - {title}"
+        if self._config.telegram_live.title_timestamp:
+            stamp = datetime.now(ZoneInfo(self._config.timezone)).strftime("(%Y-%m-%d %H:%M %Z)")
+            live_title = f"{live_title} {stamp}"
+        live_title = sanitize_metadata_text(live_title, limit=200)
         result = await client(
             CreateGroupCallRequest(peer=input_peer, rtmp_stream=True, random_id=secrets.randbits(31), title=live_title)
         )
@@ -245,6 +389,7 @@ class TelegramLiveStreamer:
         if not isinstance(call_id, int) or not isinstance(access_hash, int):
             msg = f"Telegram live create for {channel} returned no call id: {result!r}"
             raise RuntimeError(msg)
+        record_baseline_id: int | None = None
         if self._config.telegram_live.record:
             # Best effort: a recording failure must not kill the stream.
             # The file lands in Saved Messages when the stream ends.
@@ -257,17 +402,76 @@ class TelegramLiveStreamer:
                         video_portrait=False,
                     )
                 )
+                # The latest Saved Messages id now: the recording file
+                # is the first media message past it after the end.
+                record_baseline_id = await self._saved_messages_latest_id(client)
             except Exception:
                 logger.warning("[telegram_live] Server recording start failed for %s", channel, exc_info=True)
         raw_id = str(peer_id).removeprefix("-100")
         logger.info("[telegram_live] Live started for %s on Telegram channel %s", channel, peer_id)
-        return {
+        info: dict[str, Any] = {
             "peer_id": peer_id,
             "call_id": call_id,
             "access_hash": access_hash,
             "rtmp_url": join_rtmp_url(url, key),
             "telegram_url": f"https://t.me/c/{raw_id}",
         }
+        if record_baseline_id is not None:
+            info["record_baseline_id"] = record_baseline_id
+        return info
+
+    @staticmethod
+    async def _saved_messages_latest_id(client: Any) -> int | None:
+        """Id of the newest Saved Messages message, or None on failure."""
+        try:
+            msgs = await client.get_messages("me", limit=1)
+        except Exception:
+            logger.warning("[telegram_live] Saved Messages read failed", exc_info=True)
+            return None
+        if not msgs:
+            return 0
+        latest = getattr(msgs[0], "id", None)
+        return latest if isinstance(latest, int) else None
+
+    async def forward_recording(
+        self, channel: str, baseline_id: int, *, timeout_s: float = 600.0, poll_s: float = 20.0
+    ) -> dict[str, Any] | None:
+        """Forward this stream's recording from Saved Messages to the channel.
+
+        Saved Messages has no shareable link, so the forwarded post is
+        the archive: it lives in the channel and has a channel link.
+        The recording is the first media message newer than
+        baseline_id (the newest Saved Messages id when the recording
+        started). Polls until it appears or the timeout passes; None
+        on timeout or when the channel has no mapped peer.
+        """
+        peer_id = self._config.channel_telegram_peers.get(channel)
+        if not peer_id:
+            return None
+        client = await self.connect()
+        input_peer = await client.get_input_entity(peer_id)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while True:
+            msgs = await client.get_messages("me", limit=10)
+            candidates = [
+                m
+                for m in msgs or []
+                if isinstance(getattr(m, "id", None), int) and m.id > baseline_id and getattr(m, "media", None)
+            ]
+            if candidates:
+                msg = min(candidates, key=lambda m: m.id)
+                sent = await client.forward_messages(input_peer, messages=msg.id, from_peer="me")
+                first = sent[0] if isinstance(sent, list) else sent
+                post_id = getattr(first, "id", None)
+                raw_id = str(peer_id).removeprefix("-100")
+                url = f"https://t.me/c/{raw_id}/{post_id}" if isinstance(post_id, int) else f"https://t.me/c/{raw_id}"
+                logger.info("[telegram_live] Forwarded the recording of %s to Telegram channel %s", channel, peer_id)
+                return {"message_id": post_id, "telegram_url": url}
+            if loop.time() >= deadline:
+                logger.warning("[telegram_live] No recording arrived in Saved Messages for %s", channel)
+                return None
+            await asyncio.sleep(poll_s)
 
     async def end_stream(self, telegram_info: dict[str, Any]) -> None:
         """End one live stream. Raises on failure: the caller logs it."""

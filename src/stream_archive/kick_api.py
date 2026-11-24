@@ -32,6 +32,7 @@ _RETRY_DELAYS = (1.0, 3.0)
 class KickAPI:
     TOKEN_URL = "https://id.kick.com/oauth/token"
     CHANNELS_URL = "https://api.kick.com/public/v1/channels"
+    USERS_URL = "https://api.kick.com/public/v1/users"
     PUBLIC_KEY_URL = "https://api.kick.com/public/v1/public-key"
     EVENTS_SUBS_URL = "https://api.kick.com/public/v1/events/subscriptions"
     MAX_SLUGS_PER_REQUEST = 50
@@ -153,6 +154,30 @@ class KickAPI:
                     "broadcaster_user_id": item.get("broadcaster_user_id"),
                 }
         return out
+
+    async def get_profile_image(self, slug: str) -> str | None:
+        """Profile image URL of one channel's broadcaster, or None.
+
+        The channels payload carries no profile picture, only the
+        broadcaster user id. The users endpoint answers
+        profile_picture for that id under the same app token.
+        """
+        headers = await self._headers()
+        resp = await self._request("GET", self.CHANNELS_URL, headers=headers, params=[("slug", slug)])
+        resp.raise_for_status()
+        items = (resp.json() or {}).get("data") or []
+        if not items:
+            return None
+        user_id = items[0].get("broadcaster_user_id")
+        if not user_id:
+            return None
+        resp = await self._request("GET", self.USERS_URL, headers=headers, params={"id": user_id})
+        resp.raise_for_status()
+        users = (resp.json() or {}).get("data") or []
+        if not users:
+            return None
+        url = users[0].get("profile_picture")
+        return url if isinstance(url, str) and url else None
 
     async def get_top_livestreams(self, limit: int = 5) -> list[tuple[str, int, int]]:
         """Busiest live channels as (slug, broadcaster id, viewers).

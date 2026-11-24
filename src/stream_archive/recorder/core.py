@@ -100,6 +100,9 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, TelegramOut
         self._notifier = notifier
         self._recordings = {}
         self._locks = {}
+        #: Background finalize follow-ups (the recording forward). The
+        #: set holds the tasks so they are not collected mid-flight.
+        self._post_tasks: set[asyncio.Task[Any]] = set()
         self._session = Streamlink()
         # Short HTTP timeout: a dead playlist proxy must fail over fast
         # instead of burning 30 s per proxy before the recording starts.
@@ -792,6 +795,11 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, TelegramOut
         self, channel: str, entry: Recording, chat_recorder: ChatRecorder | None, *, finish_media: bool = True
     ) -> None:
         """Finalize the chat capture, the broadcast, and the held state."""
+        # Read the chat paths before the finalizers run: they close the
+        # writers and may drop the state that holds them.
+        chat_path = getattr(chat_recorder, "chat_path", None) if chat_recorder else None
+        kick_state = entry.get("kick_chat")
+        kick_chat_path = kick_state.get("path") if kick_state else None
         if chat_recorder:
             # _finalize_chat releases the writer's paths. Stopping the capture
             # directly would leave its chat file protected from the archive
@@ -804,6 +812,14 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, TelegramOut
         telegram_info = entry.get("telegram_info")
         if telegram_info:
             await self._end_telegram_stream(channel, telegram_info)
+            # The chat file is final now. A discarded kick file (no
+            # messages) simply does not exist, so the exists check is
+            # the gate for both platforms.
+            for path in (chat_path, kick_chat_path):
+                if path and os.path.exists(path):
+                    await self._post_chat_log_file(channel, entry, path)
+                    break
+            self._schedule_recording_forward(channel, entry, telegram_info)
         if not finish_media:
             return
         await self._remux_finished_file(entry)

@@ -84,6 +84,29 @@ def _close_api_clients():
         _apis.clear()
 
 
+def test_get_profile_image_follows_the_broadcaster_id():
+    def handler(request):
+        if request.url.path == "/public/v1/channels":
+            return httpx.Response(200, json={"data": [{"slug": "sluggy", "broadcaster_user_id": 55}]})
+        if request.url.path == "/public/v1/users":
+            assert request.url.params["id"] == "55"
+            return httpx.Response(
+                200, json={"data": [{"user_id": 55, "profile_picture": "https://files.kick.com/p.webp"}]}
+            )
+        return no_other_request(request)
+
+    api = make_api(handler)
+    assert asyncio.run(api.get_profile_image("sluggy")) == "https://files.kick.com/p.webp"
+
+
+def test_get_profile_image_unknown_channel_returns_none():
+    def handler(request):
+        return httpx.Response(200, json={"data": []})
+
+    api = make_api(handler)
+    assert asyncio.run(api.get_profile_image("ghost")) is None
+
+
 def test_token_fetched_and_cached():
     calls = {"tokens": 0}
 

@@ -25,7 +25,10 @@ The account must own or manage each target channel. One Telegram channel can hol
        "api_hash": "${TELEGRAM_API_HASH}",
        "session": "telegram_live.session",
        "auto_create_channels": true,
-       "record": false
+       "record": false,
+       "title_timestamp": true,
+       "post_chat_log": true,
+       "forward_recording": true
    }
    ```
 
@@ -47,6 +50,16 @@ The account must own or manage each target channel. One Telegram channel can hol
 ```
 
 With `telegram_live.auto_create_channels` on (the default), a channel with no entry gets a new **private** Telegram channel at its first stream. The app stores the peer id in `config.json` at once, so a restart reuses the same channel. The channel title is `<name> restream`, and its description links the source.
+
+## Channel photo, stream title, chat log
+
+At each stream start the app sets the Telegram channel photo to the broadcaster's profile image (Twitch `profile_image_url`, Kick `profile_picture`). The applied URL is stored in `channel_telegram_icon_urls`, so the photo is set once and again only when the broadcaster changes their icon. This also covers channels that exist already: the photo lands at their next stream. Icons are best effort: a failed lookup, download, or set never blocks the stream.
+
+The live stream title is `author - title`, plus the start time in the app timezone when `telegram_live.title_timestamp` is on (the default): `author - title (2026-11-24 12:31 JST)`.
+
+When a Telegram restream ends and `telegram_live.post_chat_log` is on (the default), the finished chat log file is posted to the channel. This needs `record_chat`: without a chat file there is nothing to post.
+
+With `telegram_live.record` on, the server-side recording lands in the account's Saved Messages after the stream ends. Saved Messages has no shareable link, so with `telegram_live.forward_recording` on (the default) the app forwards the file to the channel once it arrives (polling up to 10 minutes). The forwarded post is the archive copy, and its channel link goes to the operator notification.
 
 Public channels (with a `@username`) have a small per-account cap, so auto-create makes private channels. Join them with an invite link from the Telegram app.
 
