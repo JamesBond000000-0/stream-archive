@@ -6,12 +6,14 @@ prove the request flow without a network or an account.
 """
 
 import asyncio
+import re
 import types
 
 import pytest
 from conftest import make_config as valid_config
 from conftest import read_file
 
+import stream_archive.telegram_streamer as streamer_module
 from stream_archive.telegram_streamer import TelegramLiveStreamer, join_rtmp_url, marked_peer_id
 
 
@@ -30,6 +32,8 @@ class FakeTelethonClient:
 
     def __init__(self, *args):
         self.requests = []
+        self.sent_files = []
+        self.uploads = []
         self.authorized = True
         self.disconnected = False
 
@@ -48,6 +52,15 @@ class FakeTelethonClient:
     async def get_input_entity(self, peer_id):
         return ("input-peer", peer_id)
 
+    async def upload_file(self, file, file_name=None):
+        data = file.read()
+        self.uploads.append((file_name, data))
+        return ("uploaded", file_name)
+
+    async def send_file(self, entity, file=None, caption=None):
+        self.sent_files.append((entity, file, caption))
+        return types.SimpleNamespace(id=1)
+
     async def __call__(self, request):
         self.requests.append(request)
         name = type(request).__name__
@@ -59,6 +72,8 @@ class FakeTelethonClient:
         if name == "CreateChannelRequest":
             return types.SimpleNamespace(chats=[types.SimpleNamespace(id=777)])
         if name == "ToggleGroupCallRecordRequest":
+            return types.SimpleNamespace()
+        if name == "EditPhotoRequest":
             return types.SimpleNamespace()
         if name == "DiscardGroupCallRequest":
             return types.SimpleNamespace()
@@ -91,7 +106,9 @@ def test_marked_peer_id():
 
 
 def test_create_stream_joins_rtmp_and_returns_call_ids(tmp_path):
-    streamer, client, _cfg = make_streamer(tmp_path, channel_telegram_peers={"ch": -100777})
+    streamer, client, _cfg = make_streamer(
+        tmp_path, channel_telegram_peers={"ch": -100777}, telegram_live={"title_timestamp": False}
+    )
 
     async def scenario():
         return await streamer.create_stream("author", "Title", "twitch:ch", "Game")
@@ -164,6 +181,114 @@ def test_ensure_destination_without_auto_create_fails(tmp_path):
 
     with pytest.raises(RuntimeError, match="No Telegram channel is mapped"):
         asyncio.run(scenario())
+
+
+def test_create_stream_title_carries_the_start_timestamp(tmp_path):
+    streamer, client, _cfg = make_streamer(tmp_path, channel_telegram_peers={"ch": -100777})
+
+    async def scenario():
+        return await streamer.create_stream("author", "Title", "twitch:ch", "Game")
+
+    asyncio.run(scenario())
+    create = [r for r in client.requests if type(r).__name__ == "CreateGroupCallRequest"][0]
+    assert re.fullmatch(r"author - Title \(\d{4}-\d{2}-\d{2} \d{2}:\d{2} [A-Z]+\)", create.title)
+
+
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"fake-png-payload"
+
+
+def _icon_streamer(tmp_path, monkeypatch, url="https://cdn.example/icon.png", **overrides):
+    """Streamer with a resolver and a download that answer one PNG icon."""
+    streamer, client, cfg = make_streamer(tmp_path, channel_telegram_peers={"ch": -100777}, **overrides)
+
+    async def resolve(channel):
+        assert channel == "twitch:ch"
+        return url
+
+    async def download(got_url):
+        assert got_url == url
+        return _PNG_BYTES
+
+    streamer.set_profile_image_resolver(resolve)
+    monkeypatch.setattr(streamer_module, "_download_image", download)
+    return streamer, client, cfg
+
+
+def test_create_stream_sets_the_channel_icon_once(tmp_path, monkeypatch):
+    streamer, client, cfg = _icon_streamer(tmp_path, monkeypatch)
+
+    async def scenario():
+        await streamer.create_stream("author", "Title", "twitch:ch", "Game")
+        await streamer.create_stream("author", "Title", "twitch:ch", "Game")
+
+    asyncio.run(scenario())
+    edits = [r for r in client.requests if type(r).__name__ == "EditPhotoRequest"]
+    assert len(edits) == 1
+    assert edits[0].channel == ("input-peer", -100777)
+    assert edits[0].photo.file == ("uploaded", "icon.png")
+    assert client.uploads == [("icon.png", _PNG_BYTES)]
+    assert cfg.channel_telegram_icon_urls == {"twitch:ch": "https://cdn.example/icon.png"}
+    assert read_file(tmp_path)["channel_telegram_icon_urls"] == {"twitch:ch": "https://cdn.example/icon.png"}
+
+
+def test_create_stream_skips_the_icon_when_the_url_is_unchanged(tmp_path, monkeypatch):
+    streamer, client, _cfg = _icon_streamer(
+        tmp_path, monkeypatch, channel_telegram_icon_urls={"ch": "https://cdn.example/icon.png"}
+    )
+
+    async def download(url):  # must not run: the stored URL already matches
+        msg = "download called for an unchanged icon"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(streamer_module, "_download_image", download)
+
+    async def scenario():
+        return await streamer.create_stream("author", "Title", "twitch:ch", "Game")
+
+    asyncio.run(scenario())
+    assert [r for r in client.requests if type(r).__name__ == "EditPhotoRequest"] == []
+
+
+def test_create_stream_survives_a_failing_icon_lookup(tmp_path, monkeypatch):
+    streamer, client, _cfg = make_streamer(tmp_path, channel_telegram_peers={"ch": -100777})
+
+    async def resolve(channel):
+        msg = "platform down"
+        raise RuntimeError(msg)
+
+    streamer.set_profile_image_resolver(resolve)
+
+    async def scenario():
+        return await streamer.create_stream("author", "Title", "twitch:ch", "Game")
+
+    info = asyncio.run(scenario())
+    assert info["call_id"] == 42
+    assert [r for r in client.requests if type(r).__name__ == "EditPhotoRequest"] == []
+
+
+def test_as_png_or_jpeg_passes_png_and_rejects_garbage(tmp_path):
+    assert asyncio.run(streamer_module._as_png_or_jpeg(_PNG_BYTES)) == _PNG_BYTES
+    assert asyncio.run(streamer_module._as_png_or_jpeg(b"not an image at all")) is None
+
+
+def test_post_chat_log_sends_the_file_to_the_mapped_peer(tmp_path):
+    streamer, client, _cfg = make_streamer(tmp_path, channel_telegram_peers={"ch": -100777})
+
+    async def scenario():
+        return await streamer.post_chat_log("twitch:ch", "/data/chat.chat.json", "Chat log: Title")
+
+    assert asyncio.run(scenario()) is True
+    assert client.sent_files == [(("input-peer", -100777), "/data/chat.chat.json", "Chat log: Title")]
+
+
+def test_post_chat_log_skips_an_unmapped_channel(tmp_path):
+    streamer, client, _cfg = make_streamer(tmp_path)
+
+    async def scenario():
+        return await streamer.post_chat_log("twitch:ch", "/data/chat.chat.json", "Chat log: Title")
+
+    assert asyncio.run(scenario()) is False
+    assert client.sent_files == []
 
 
 def test_connect_rejects_a_session_that_is_not_logged_in(tmp_path):

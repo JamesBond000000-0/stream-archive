@@ -9,7 +9,7 @@ from aiohttp import web
 
 from stream_archive import events
 from stream_archive.api import ControlAPI
-from stream_archive.config import AppConfig, get_config, telegram_enabled
+from stream_archive.config import AppConfig, bare_name, get_config, is_kick_channel, telegram_enabled
 from stream_archive.eventsub import EventSubClient
 from stream_archive.http_client import build_http_client
 from stream_archive.kick_api import KickAPI
@@ -101,6 +101,25 @@ async def _start_health_server(host: str = _HEALTH_HOST, port: int = _HEALTH_POR
         logger.warning("[scheduler] health endpoint unavailable on %s:%s: %s", host, port, e)
         return None
     return runner
+
+
+def _profile_image_resolver(twitch_api: TwitchAPI, kick_api: KickAPI) -> Any:
+    """Build the Telegram channel photo lookup: channel -> image URL.
+
+    A failure answers None. The streamer treats icons as best effort,
+    so a platform outage must not surface in the stream start path.
+    """
+
+    async def resolve(channel: str) -> str | None:
+        try:
+            if is_kick_channel(channel):
+                return await kick_api.get_profile_image(bare_name(channel))
+            return await twitch_api.get_profile_image(bare_name(channel))
+        except Exception:
+            logger.warning("[scheduler] Profile image lookup failed for %s", channel, exc_info=True)
+            return None
+
+    return resolve
 
 
 async def run_scheduler() -> None:
@@ -212,6 +231,9 @@ async def run_scheduler() -> None:
         monitor.on_stopped = _maybe_auto_upload
 
         kick_api = KickAPI(config, http=shared_http)
+
+        if telegram_streamer is not None:
+            telegram_streamer.set_profile_image_resolver(_profile_image_resolver(twitch_api, kick_api))
 
         eventsub = EventSubClient(twitch_api, monitor, config)
         kick_webhook = KickWebhook(config, monitor, recorder, kick_api, notifier)

@@ -3271,6 +3271,7 @@ class FakeTelegramStreamer:
     def __init__(self, create_error=None):
         self.create_error = create_error
         self.ended = []
+        self.chat_logs = []
 
     async def create_stream(self, author, title, channel, game):
         if self.create_error:
@@ -3285,6 +3286,85 @@ class FakeTelegramStreamer:
 
     async def end_stream(self, telegram_info):
         self.ended.append(telegram_info)
+
+    async def post_chat_log(self, channel, file_path, caption):
+        self.chat_logs.append((channel, file_path, caption))
+        return True
+
+
+class _StubChatRecorder:
+    """Chat recorder stand-in for finalize tests: a path and a stop()."""
+
+    def __init__(self, chat_path):
+        self.chat_path = chat_path
+        self.stopped = False
+
+    async def stop(self):
+        self.stopped = True
+
+
+def _telegram_entry(chat_recorder=None):
+    return {
+        "tasks": [],
+        "mode": "telegram",
+        "title": "Stream Title",
+        "youtube_info": None,
+        "telegram_info": {"peer_id": -100777, "call_id": 42, "access_hash": 99},
+        "filepath": None,
+        "chat_recorder": chat_recorder,
+    }
+
+
+def test_finalize_posts_the_chat_log_to_telegram(tmp_path):
+    config = make_config(tmp_path)
+    config.output_mode = "telegram"
+    streamer = FakeTelegramStreamer()
+    rec = Recorder(config, telegram_streamer=streamer)
+    chat_file = tmp_path / "chat" / "stream.chat.json"
+    chat_file.parent.mkdir(parents=True)
+    chat_file.write_text("{}")
+    stub = _StubChatRecorder(str(chat_file))
+    entry = _telegram_entry(stub)
+
+    async def scenario():
+        await rec._finalize_entry("twitch:ch", entry, stub)
+
+    asyncio.run(scenario())
+    assert streamer.ended and streamer.chat_logs == [("twitch:ch", str(chat_file), "Chat log: Stream Title")]
+
+
+def test_finalize_skips_the_chat_log_when_the_file_is_gone(tmp_path):
+    config = make_config(tmp_path)
+    config.output_mode = "telegram"
+    streamer = FakeTelegramStreamer()
+    rec = Recorder(config, telegram_streamer=streamer)
+    stub = _StubChatRecorder(str(tmp_path / "chat" / "discarded.chat.json"))
+    entry = _telegram_entry(stub)
+
+    async def scenario():
+        await rec._finalize_entry("twitch:ch", entry, stub)
+
+    asyncio.run(scenario())
+    assert streamer.ended and streamer.chat_logs == []
+
+
+def test_finalize_skips_the_chat_log_when_disabled(tmp_path):
+    config = make_config(tmp_path)
+    config.output_mode = "telegram"
+    config.telegram_live.post_chat_log = False
+    streamer = FakeTelegramStreamer()
+    rec = Recorder(config, telegram_streamer=streamer)
+    chat_file = tmp_path / "chat" / "stream.chat.json"
+    chat_file.parent.mkdir(parents=True)
+    chat_file.write_text("{}")
+    stub = _StubChatRecorder(str(chat_file))
+    entry = _telegram_entry(stub)
+
+    async def scenario():
+        await rec._finalize_entry("twitch:ch", entry, stub)
+
+    asyncio.run(scenario())
+    assert streamer.ended and streamer.chat_logs == []
 
 
 def test_reserve_start_blocks_telegram_at_cap(tmp_path):

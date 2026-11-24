@@ -66,6 +66,27 @@ def assert_auth_headers(request):
     assert request.headers["Client-Id"] == "client_id"
 
 
+def test_get_profile_image_returns_the_url():
+    def handler(request):
+        assert_auth_headers(request)
+        assert request.url.path == "/helix/users"
+        assert request.url.params["login"] == "someone"
+        return httpx.Response(
+            200, json={"data": [{"id": "1", "login": "someone", "profile_image_url": "https://cdn.example/p.png"}]}
+        )
+
+    api = make_api(handler)
+    assert asyncio.run(api.get_profile_image("someone")) == "https://cdn.example/p.png"
+
+
+def test_get_profile_image_unknown_user_returns_none():
+    def handler(request):
+        return httpx.Response(200, json={"data": []})
+
+    api = make_api(handler)
+    assert asyncio.run(api.get_profile_image("ghost")) is None
+
+
 def test_token_fetched_and_cached():
     calls = {"tokens": 0}
 

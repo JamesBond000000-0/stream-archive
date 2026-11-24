@@ -22,6 +22,7 @@
     "channel_youtube_hold_seconds": {},
     "channel_youtube_vod_upload": {},
     "channel_telegram_peers": {},
+    "channel_telegram_icon_urls": {},
     "channel_preferred_qualities": {},
     "channel_categories": {},
     "eventsub": {
@@ -67,7 +68,9 @@
         "api_hash": "",
         "session": "telegram_live.session",
         "auto_create_channels": true,
-        "record": false
+        "record": false,
+        "title_timestamp": true,
+        "post_chat_log": true
     },
     "retention_days": 0,
     "preferred_quality": "best",

@@ -459,6 +459,13 @@ class TelegramLiveConfig(BaseModel):
     #: The file lands in the account's Saved Messages when the stream
     #: ends. Off by default: a long stream can pass the file size cap.
     record: StrictBool = False
+    #: Append the start time to each live stream title, in the app
+    #: timezone: "author - title (2026-11-24 12:31 JST)".
+    title_timestamp: StrictBool = True
+    #: Post the finished chat log file to the Telegram channel when a
+    #: Telegram restream ends. Needs record_chat; without a chat file
+    #: there is nothing to post.
+    post_chat_log: StrictBool = True
 
     @model_validator(mode="after")
     def _require_creds_when_enabled(self) -> TelegramLiveConfig:
@@ -504,6 +511,10 @@ class AppConfig(BaseModel):
     #: One Telegram channel can hold one live stream at a time, so each
     #: monitored channel needs its own entry for parallel restreams.
     channel_telegram_peers: dict[str, StrictInt] = {}
+    #: Monitored channel -> profile image URL last set as the Telegram
+    #: channel photo. The streamer compares it with the live URL at each
+    #: stream start, so a new broadcaster icon is picked up once.
+    channel_telegram_icon_urls: dict[str, StrictStr] = {}
     channel_preferred_qualities: dict[str, str] = {}
     channel_categories: dict[str, list[str]] = {}
     youtube: YouTubeConfig = YouTubeConfig()
@@ -592,6 +603,11 @@ class AppConfig(BaseModel):
     @classmethod
     def _normalize_vod_upload_keys(cls, v: dict[str, StrictBool]) -> dict[str, StrictBool]:
         return _normalize_channel_map(v, "channel_youtube_vod_upload")
+
+    @field_validator("channel_telegram_icon_urls")
+    @classmethod
+    def _normalize_telegram_icon_keys(cls, v: dict[str, StrictStr]) -> dict[str, StrictStr]:
+        return _normalize_channel_map(v, "channel_telegram_icon_urls")
 
     @field_validator("channel_telegram_peers")
     @classmethod

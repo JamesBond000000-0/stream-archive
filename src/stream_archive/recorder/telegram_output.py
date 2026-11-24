@@ -16,7 +16,7 @@ import os
 from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
-from stream_archive.config import AppConfig, channel_url
+from stream_archive.config import TELEGRAM_MODES, AppConfig, channel_url
 from stream_archive.recorder.common import sanitize_metadata_text
 from stream_archive.recorder.types import Recording
 
@@ -57,6 +57,27 @@ class TelegramOutputMixin:
             await self._require_telegram(channel).end_stream(telegram_info)
         except Exception as e:
             logger.error("[recorder] [telegram] Error ending live stream for %s: %s", channel, e)
+
+    async def _post_chat_log_file(self, channel: str, entry: Recording, chat_path: str) -> None:
+        """Post the finished chat log to the Telegram channel. Never raises.
+
+        Runs at finalize, after the chat writer closed the file. Only
+        recordings that actually restreamed to Telegram qualify: the
+        caller passes the entry after its telegram_info was used to end
+        the stream.
+        """
+        if not self._config.telegram_live.post_chat_log:
+            return
+        if entry.get("mode") not in TELEGRAM_MODES:
+            return
+        telegram = self._telegram
+        if telegram is None:
+            return
+        caption = f"Chat log: {sanitize_metadata_text(entry.get('title') or 'Unknown')}"
+        try:
+            await telegram.post_chat_log(channel, chat_path, caption)
+        except Exception:
+            logger.error("[recorder] [telegram] Chat log post failed for %s", channel, exc_info=True)
 
     async def _stream_telegram(
         self,

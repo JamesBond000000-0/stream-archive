@@ -68,6 +68,9 @@ Keys marked **hand edit** stay read-only over the Telegram bot, the web panel, a
 | `telegram_live.session` | no, hand edit | `telegram_live.session` | Session file of the Telegram user login, relative to the data dir. Keep it private: it is a full account login |
 | `telegram_live.auto_create_channels` | no | `true` | Create a private Telegram channel when a monitored channel has no entry in `channel_telegram_peers` yet, and store its peer id |
 | `telegram_live.record` | no | `false` | Start the Telegram server-side recording with each live stream. The file lands in the account's Saved Messages when the stream ends |
+| `telegram_live.title_timestamp` | no | `true` | Append the start time (app timezone) to each Telegram live stream title |
+| `telegram_live.post_chat_log` | no | `true` | Post the finished chat log file to the Telegram channel when a restream ends. Needs `record_chat` |
+| `channel_telegram_icon_urls` | no | `{}` | Monitored channel -> profile image URL last set as the Telegram channel photo. The app maintains this; a hand edit forces a re-set at the next stream |
 | `disk.max_total_gb` | no | `0` | Delete the oldest archive files when the total exceeds this size in GB. `0` disables the cap |
 | `disk.check_interval_s` | no, hand edit | `60` | Seconds between disk watchdog checks |
 | `disk.delete_oldest` | no | `true` | On a breach, delete the oldest archive files. `false` stops new recordings instead |
