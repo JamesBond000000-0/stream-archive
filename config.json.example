@@ -24,6 +24,7 @@
     "channel_telegram_peers": {},
     "channel_telegram_icon_urls": {},
     "telegram_forwarded_recording_keys": [],
+    "telegram_recording_claims": [],
     "channel_preferred_qualities": {},
     "channel_categories": {},
     "eventsub": {
