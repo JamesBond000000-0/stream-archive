@@ -2810,7 +2810,9 @@ def test_start_arms_the_watchdog_even_when_the_cap_is_off(tmp_path, monkeypatch)
     config = make_config(tmp_path)
     config.disk = {"max_total_gb": 0}  # shipped default: cap disabled
     rec = Recorder(config)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda channel, title, game: (SustainedStream(), "a", "t", "g"))
+    monkeypatch.setattr(
+        rec, "_resolve_stream", lambda channel, title, game, login=None: (SustainedStream(), "a", "t", "g")
+    )
 
     async def scenario():
         assert await rec.start("twitch:ch")
@@ -3028,7 +3030,9 @@ def test_failed_start_discards_the_partial_chat_and_releases_its_path(tmp_path, 
     # release its path.
     monkeypatch.setattr(ChatRecorder, "start", failing_start)
     rec = Recorder(config)
-    monkeypatch.setattr(rec, "_resolve_stream", lambda channel, title, game: (SustainedStream(), "a", "t", "g"))
+    monkeypatch.setattr(
+        rec, "_resolve_stream", lambda channel, title, game, login=None: (SustainedStream(), "a", "t", "g")
+    )
 
     async def scenario():
         assert await rec.start("twitch:ch") is False

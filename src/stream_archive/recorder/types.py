@@ -58,6 +58,9 @@ class Recording(TypedDict, total=False):
     title: str | None
     game: str | None
     user_id: str | None
+    #: Current Twitch login at start, when the monitor resolved one.
+    #: It differs from the channel key after a rename.
+    login: str | None
     filepath: str | None
     youtube_info: dict[str, Any] | None
     telegram_info: dict[str, Any] | None

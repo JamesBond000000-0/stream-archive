@@ -161,13 +161,17 @@ def bare_name(channel: str) -> str:
     return channel
 
 
-def channel_url(channel: str) -> str:
-    """Return the public profile URL for notifications."""
-    return (
-        f"https://kick.com/{bare_name(channel)}"
-        if is_kick_channel(channel)
-        else f"https://twitch.tv/{bare_name(channel)}"
-    )
+def channel_url(channel: str, login: str | None = None) -> str:
+    """Return the public profile URL for notifications.
+
+    ``login`` overrides the name in a Twitch channel key. The monitor
+    passes the current login of a renamed account, so the URL and the
+    stream resolve keep working while the stored key still holds the
+    old name.
+    """
+    if is_kick_channel(channel):
+        return f"https://kick.com/{bare_name(channel)}"
+    return f"https://twitch.tv/{login or bare_name(channel)}"
 
 
 def effective_quality(config: AppConfig, channel: str) -> str:
@@ -551,6 +555,11 @@ class AppConfig(BaseModel):
     telegram_recording_claims: list[RecordingClaim] = []
     channel_preferred_qualities: dict[str, str] = {}
     channel_categories: dict[str, list[str]] = {}
+    #: Monitored Twitch channel -> numeric Twitch user id. The id never
+    #: changes, so it anchors tracking: /add resolves it, the monitor
+    #: backfills it for entries that predate it, and a login rename is
+    #: followed through it. The app maintains this map.
+    channel_twitch_ids: dict[str, StrictStr] = {}
     youtube: YouTubeConfig = YouTubeConfig()
     update_check: UpdateCheckConfig = UpdateCheckConfig()
     preferred_quality: str = Field("best", min_length=1)
@@ -642,6 +651,15 @@ class AppConfig(BaseModel):
     @classmethod
     def _normalize_telegram_icon_keys(cls, v: dict[str, StrictStr]) -> dict[str, StrictStr]:
         return _normalize_channel_map(v, "channel_telegram_icon_urls")
+
+    @field_validator("channel_twitch_ids")
+    @classmethod
+    def _normalize_twitch_id_keys(cls, v: dict[str, StrictStr]) -> dict[str, StrictStr]:
+        for ch, user_id in v.items():
+            if not user_id.isdigit():
+                msg = f"channel_twitch_ids.{ch} must be a numeric Twitch user id"
+                raise ValueError(msg)
+        return _normalize_channel_map(v, "channel_twitch_ids")
 
     @field_validator("channel_telegram_peers")
     @classmethod
@@ -1095,6 +1113,33 @@ def api_base_url(config: AppConfig) -> str:
     """Public base URL of the control API, or "" when no public URL is set."""
     base = endpoint_base_url(config)
     return f"{base}{API_PATH}/" if base else ""
+
+
+def _rekey[V](mapping: dict[str, V], old: str, new: str) -> None:
+    if old in mapping:
+        mapping[new] = mapping.pop(old)
+
+
+def rename_channel_key(config: AppConfig, old: str, new: str) -> bool:
+    """Move one channel and all its per-channel entries to a new key.
+
+    Returns True when the key moved. Does nothing when the keys match,
+    the old key is not monitored, or the new key is already monitored:
+    the caller keeps tracking through the stored Twitch user id in
+    those cases. Call this inside an ``apply_config_change`` mutation.
+    """
+    if old == new or old not in config.channels or new in config.channels:
+        return False
+    config.channels[config.channels.index(old)] = new
+    _rekey(config.channel_output_modes, old, new)
+    _rekey(config.channel_youtube_hold_seconds, old, new)
+    _rekey(config.channel_youtube_vod_upload, old, new)
+    _rekey(config.channel_telegram_peers, old, new)
+    _rekey(config.channel_telegram_icon_urls, old, new)
+    _rekey(config.channel_preferred_qualities, old, new)
+    _rekey(config.channel_categories, old, new)
+    _rekey(config.channel_twitch_ids, old, new)
+    return True
 
 
 def apply_config_change(config: AppConfig, mutate: Callable[[AppConfig], None]) -> AppConfig:

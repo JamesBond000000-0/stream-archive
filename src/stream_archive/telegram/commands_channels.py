@@ -3,6 +3,7 @@ from typing import Any
 
 from stream_archive.config import (
     AppConfig,
+    bare_name,
     is_kick_channel,
     normalize_channel_name,
 )
@@ -53,15 +54,38 @@ class ChannelsCommands:
         if ch is None:
             return err
 
+        # A Twitch channel is stored with its numeric user id, so a
+        # later login rename keeps tracking. Without a bound API client
+        # (tests) the add stays as before, and the monitor backfills
+        # the id on its first pass.
+        twitch_id: str | None = None
+        twitch_api = getattr(self, "_twitch_api", None)
+        if not is_kick_channel(ch) and twitch_api is not None:
+            try:
+                resolved = await twitch_api.resolve_user_ids([bare_name(ch)])
+            except Exception:
+                logger.warning("[telegram] Twitch lookup failed for %s", ch, exc_info=True)
+                return "\u274c Twitch lookup failed - try again later."
+            twitch_id = resolved.get(bare_name(ch))
+            if twitch_id is None:
+                return f"\u274c Twitch user {bare_name(ch)} not found."
+            for other, other_id in self._config.channel_twitch_ids.items():
+                if other_id == twitch_id and other != ch:
+                    return f"\u274c That account is already monitored as {other}."
+
         def mutate(candidate: AppConfig) -> None:
             if ch in candidate.channels:
                 msg = f"{ch} is already monitored"
                 raise ValueError(msg)
             candidate.channels.append(ch)
+            if twitch_id is not None:
+                candidate.channel_twitch_ids[ch] = twitch_id
 
         result: str = self._apply(mutate, lambda c: f"Added {ch} - {len(c.channels)} channel(s) monitored", chat_id)
         if is_error(result):
             return result
+        if twitch_id is not None:
+            result = f"{result} (Twitch id {twitch_id})"
         if is_kick_channel(ch):
             if self._kick_webhook:
                 await self._kick_webhook.add_channel(ch)
@@ -105,6 +129,10 @@ class ChannelsCommands:
             candidate.channel_youtube_hold_seconds.pop(ch, None)
             candidate.channel_preferred_qualities.pop(ch, None)
             candidate.channel_categories.pop(ch, None)
+            # The id must go too: Twitch recycles freed logins, so a
+            # stored id would attach the old account to a new owner
+            # who takes the name later.
+            candidate.channel_twitch_ids.pop(ch, None)
 
         result: str = self._apply(mutate, lambda c: f"Removed {ch} - {len(c.channels)} channel(s) monitored", chat_id)
         if is_error(result):

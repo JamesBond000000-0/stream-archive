@@ -68,7 +68,7 @@ class StubMonitor:
         self.offline_calls = []
         self._live_channels = set()
 
-    async def handle_online(self, channel, title, game, user_id, config):
+    async def handle_online(self, channel, title, game, user_id, config, login=None):
         self.online_calls.append((channel, title, game, user_id))
 
     async def handle_offline(self, channel, config):
@@ -583,3 +583,47 @@ def test_revocation_with_a_non_object_payload_is_ignored():
             )
 
     asyncio.run(scenario())
+
+
+def test_add_channel_uses_the_stored_twitch_id():
+    """A stored id subscribes without a login resolve. After a rename
+    the login resolve would miss, and the channel would stay poll-only
+    until the key moves."""
+
+    class CountingAPI(FakeTwitchAPI):
+        def __init__(self):
+            super().__init__()
+            self.resolve_calls = []
+
+        async def resolve_user_ids(self, channels):
+            self.resolve_calls.append(list(channels))
+            return {}
+
+    api = CountingAPI()
+    config = make_config(channels=["twitch:ch"], channel_twitch_ids={"twitch:ch": "999"})
+    client = make_client(api=api, config=config)
+    client._conduit_id = "c1"
+    client._session_id = "sess-abc"
+
+    asyncio.run(client.add_channel("twitch:ch"))
+
+    assert api.resolve_calls == []
+    assert client._user_ids == {"twitch:ch": "999"}
+    assert client._id_to_channel == {"999": "twitch:ch"}
+    assert {p["condition"]["broadcaster_user_id"] for p in api.subscription_creates} == {"999"}
+
+
+def test_rename_channel_rekeys_the_subscription_maps():
+    """After a rename the same subscriptions answer to the new key.
+    The id map must follow, or events for the id get dropped as
+    unknown."""
+    client = make_client()
+    client._subs["twitch:old"] = {"stream.online": "s1", "stream.offline": "s2"}
+    client._user_ids["twitch:old"] = "u1"
+    client._id_to_channel["u1"] = "twitch:old"
+
+    asyncio.run(client.rename_channel("twitch:old", "twitch:new"))
+
+    assert client._subs == {"twitch:new": {"stream.online": "s1", "stream.offline": "s2"}}
+    assert client._user_ids == {"twitch:new": "u1"}
+    assert client._id_to_channel == {"u1": "twitch:new"}

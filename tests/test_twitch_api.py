@@ -366,3 +366,38 @@ def test_search_categories_returns_names_in_order():
             await api.client.aclose()
 
     asyncio.run(scenario())
+
+
+def test_resolve_user_logins_maps_ids_to_current_logins():
+    """The users endpoint answers by id with the current login, so a
+    renamed account reports its new name under the same id. An id with
+    no answer (a deleted account) stays absent."""
+
+    def handler(request):
+        assert request.url.path == "/helix/users"
+        assert_auth_headers(request)
+        ids = request.url.params.get_list("id")
+        assert ids == ["111", "222"]
+        return httpx.Response(200, json={"data": [{"id": "111", "login": "newname"}]})
+
+    api = make_api(handler)
+
+    async def scenario():
+        try:
+            return await api.resolve_user_logins(["111", "222"])
+        finally:
+            await api.client.aclose()
+
+    assert asyncio.run(scenario()) == {"111": "newname"}
+
+
+def test_resolve_user_logins_empty_input_makes_no_request():
+    api = make_api()  # any request fails the test
+
+    async def scenario():
+        try:
+            return await api.resolve_user_logins([])
+        finally:
+            await api.client.aclose()
+
+    assert asyncio.run(scenario()) == {}

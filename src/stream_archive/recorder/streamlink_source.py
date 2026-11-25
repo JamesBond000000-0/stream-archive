@@ -201,7 +201,9 @@ class StreamlinkMixin:
                 # plugin while load_path() still mutates the registry.
                 self._plugin_loaded = True
 
-    def _resolve_stream(self, channel: str, title: str | None, game: str | None) -> tuple[Any, str, str, str]:
+    def _resolve_stream(
+        self, channel: str, title: str | None, game: str | None, login: str | None = None
+    ) -> tuple[Any, str, str, str]:
         # The ad-block plugin lives in plugin_dir. Without this call, the
         # session uses the built-in plugin and the proxy list does nothing.
         self._load_plugin()
@@ -213,7 +215,7 @@ class StreamlinkMixin:
             plugin = plugin_class(self._session, resolved_url, options={})
             streams = plugin.streams()
         else:
-            url = channel_url(channel)
+            url = channel_url(channel, login)
             _, plugin_class, resolved_url = self._session.resolve_url(url)
             proxies = list(self._config.proxy_list)
             while True:

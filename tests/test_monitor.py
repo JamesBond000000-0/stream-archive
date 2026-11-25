@@ -1,23 +1,31 @@
 import asyncio
+import json
 import time
 
 import httpx
 from conftest import make_config
 
+from stream_archive.config import get_config
 from stream_archive.monitor import Monitor
 from stream_archive.recorder.core import _ENDED_CLEAN_GRACE_S
 
 
 class FakeTwitchAPI:
-    def __init__(self, streams=None, error=None, user_ids=None):
+    def __init__(self, streams=None, error=None, user_ids=None, logins=None):
         self.streams = streams
         self.error = error
         self.user_ids = user_ids
+        self.logins = logins or {}
         self.resolve_calls = []
+        self.resolve_login_calls = []
 
     async def resolve_user_ids(self, channels):
         self.resolve_calls.append(list(channels))
         return self.user_ids or {c: c for c in channels}
+
+    async def resolve_user_logins(self, user_ids):
+        self.resolve_login_calls.append(list(user_ids))
+        return {uid: self.logins[uid] for uid in user_ids if uid in self.logins}
 
     async def get_live_streams(self, user_ids):
         if self.error:
@@ -66,9 +74,11 @@ class FakeRecorder:
         self.delete_oldest_calls = []
         self.mode = "disk"
 
-    async def start(self, channel, title=None, game=None, user_id=None):
+    async def start(self, channel, title=None, game=None, user_id=None, login=None):
         self.started.append(channel)
-        self.started_kwargs.append({"channel": channel, "title": title, "game": game, "user_id": user_id})
+        self.started_kwargs.append(
+            {"channel": channel, "title": title, "game": game, "user_id": user_id, "login": login}
+        )
         if self.ok:
             self._recording[channel] = True
         return self.ok
@@ -461,9 +471,9 @@ def test_channel_removed_during_start_stops_the_recording():
     config = make_config(channels=["twitch:ch"])
 
     class RemovingRecorder(FakeRecorder):
-        async def start(self, channel, title=None, game=None, user_id=None):
+        async def start(self, channel, title=None, game=None, user_id=None, login=None):
             config.channels.remove(channel)  # the /remove press lands during the start
-            return await super().start(channel, title=title, game=game, user_id=user_id)
+            return await super().start(channel, title=title, game=game, user_id=user_id, login=login)
 
     rec = RemovingRecorder()
     mon = make_monitor(recorder=rec)
@@ -617,10 +627,10 @@ def test_poll_and_event_lock_same_channel():
     release = asyncio.Event()
     plain_start = rec.start
 
-    async def gated_start(channel, title=None, game=None, user_id=None):
+    async def gated_start(channel, title=None, game=None, user_id=None, login=None):
         in_start.set()
         await release.wait()
-        return await plain_start(channel, title=title, game=game, user_id=user_id)
+        return await plain_start(channel, title=title, game=game, user_id=user_id, login=login)
 
     rec.start = gated_start
 
@@ -672,6 +682,7 @@ def test_kick_live_starts_with_title_game_and_no_user_id():
             "title": "Kick title",
             "game": "Kick game",
             "user_id": None,
+            "login": None,
         }
     ]
 
@@ -1067,3 +1078,110 @@ def test_handle_online_respects_category_filter():
     assert rec.started == []
     asyncio.run(mon.handle_online("twitch:ch", "T", "Just Chatting", "u1", config))
     assert rec.started == ["twitch:ch"]
+
+
+def bound_config(tmp_path, **overrides):
+    """A config bound to a real file, so the monitor can store ids in it."""
+    cfg = make_config(**overrides)
+    (tmp_path / "config.json").write_text(json.dumps(cfg.model_dump(mode="json")))
+    return get_config(tmp_path / "config.json")
+
+
+def test_first_pass_stores_the_resolved_twitch_id(tmp_path):
+    """Backfill: a channel added before ids existed gains its id on the
+    first monitor pass, in memory and in the file. Without the store, a
+    later rename has nothing to anchor to."""
+    rec = FakeRecorder()
+    mon = make_monitor(recorder=rec)
+    config = bound_config(tmp_path, channels=["twitch:ch"])
+    api = FakeTwitchAPI(streams={}, user_ids={"ch": "111"})
+
+    asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+
+    assert config.channel_twitch_ids == {"twitch:ch": "111"}
+    on_disk = json.loads((tmp_path / "config.json").read_text())
+    assert on_disk["channel_twitch_ids"] == {"twitch:ch": "111"}
+
+
+def test_rename_moves_the_key_and_starts_under_the_new_name(tmp_path):
+    """A stored id whose login changed moves the channel key, its
+    per-channel entries and the start to the new name in one pass."""
+    rec = FakeRecorder()
+    notifier = FakeNotifier()
+    mon = make_monitor(recorder=rec, notifier=notifier)
+    renamed = []
+
+    async def on_renamed(old, new):
+        renamed.append((old, new))
+
+    mon.on_renamed = on_renamed
+    config = bound_config(
+        tmp_path,
+        channels=["twitch:old"],
+        channel_twitch_ids={"twitch:old": "111"},
+        channel_telegram_peers={"twitch:old": -1001},
+    )
+    api = FakeTwitchAPI(
+        streams={"111": {"title": "T", "game_name": "G", "user_login": "newname"}},
+        logins={"111": "newname"},
+    )
+
+    asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+
+    assert config.channels == ["twitch:newname"]
+    assert config.channel_twitch_ids == {"twitch:newname": "111"}
+    assert config.channel_telegram_peers == {"twitch:newname": -1001}
+    assert rec.started == ["twitch:newname"]
+    assert rec.started_kwargs[0]["login"] == "newname"
+    assert renamed == [("twitch:old", "twitch:newname")]
+    assert any("renamed" in m for m in notifier.messages)
+
+
+def test_rename_during_a_recording_defers_the_key_but_uses_the_new_login(tmp_path):
+    """While a recording runs under the old key the key stays, but a
+    restart resolves the stream and the chat under the current login.
+    The key moves on the first pass after the recording ends."""
+    rec = FakeRecorder()
+    mon = make_monitor(recorder=rec)
+    config = bound_config(tmp_path, channels=["twitch:old"], channel_twitch_ids={"twitch:old": "111"})
+    api = FakeTwitchAPI(
+        streams={"111": {"title": "T", "game_name": "G", "user_login": "old"}},
+        logins={"111": "old"},
+    )
+    asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+    assert rec.started == ["twitch:old"]
+
+    # The account renames and the feed drops without a clean end, so the
+    # monitor restarts the capture while the channel counts as live.
+    rec._recording.clear()
+    api.logins = {"111": "newname"}
+    api.streams = {"111": {"title": "T", "game_name": "G", "user_login": "newname"}}
+    asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+
+    assert config.channels == ["twitch:old"]  # the key move is deferred
+    assert rec.started == ["twitch:old", "twitch:old"]
+    assert rec.started_kwargs[-1]["login"] == "newname"
+
+    # The stream ends and the recording stops. The next pass moves the key.
+    api.streams = {}
+    asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+    assert rec.stopped == ["twitch:old"]
+    asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+    assert config.channels == ["twitch:newname"]
+    assert config.channel_twitch_ids == {"twitch:newname": "111"}
+
+
+def test_deleted_account_id_neither_starts_nor_stops(tmp_path):
+    """A stored id that Twitch no longer knows counts as unknown, not
+    as offline: no start, and a running recording is not stopped."""
+    rec = FakeRecorder()
+    mon = make_monitor(recorder=rec)
+    config = bound_config(tmp_path, channels=["twitch:ch"], channel_twitch_ids={"twitch:ch": "111"})
+    api = FakeTwitchAPI(streams={}, logins={})
+    mon._live_channels.add("twitch:ch")
+    rec._recording["twitch:ch"] = True
+
+    asyncio.run(mon.check_channels(api, FakeKickAPI(), config))
+
+    assert rec.started == []
+    assert rec.stopped == []
