@@ -1241,7 +1241,12 @@ def test_add_checks_live_status_at_once(tmp_path):
 
     config, ctrl, recorder, monitor, eventsub = make_controller(tmp_path)
     events_mod.reset()
-    ctrl.bind_live_check(object(), object())
+
+    class _TwitchStub:
+        async def resolve_user_ids(self, names):
+            return {name: "4242" for name in names}
+
+    ctrl.bind_live_check(_TwitchStub(), object())
 
     async def live_sweep(twitch_api, kick_api, config):
         monitor.sweeps.append(1)
@@ -2991,3 +2996,66 @@ def test_back_from_channel_categories_to_channel(tmp_path):
     assert menu_of(ctrl).menu == "channel"
     assert menu_of(ctrl).channel == "twitch:channel1"
     assert "Channel: twitch:channel1" in text
+
+
+class _TwitchIds:
+    """A Twitch API stub that resolves logins to fixed numeric ids."""
+
+    def __init__(self, ids):
+        self.ids = ids
+
+    async def resolve_user_ids(self, names):
+        return {name: self.ids[name] for name in names if name in self.ids}
+
+
+def test_add_stores_the_resolved_twitch_id(tmp_path):
+    """The /add of a Twitch channel stores the numeric id it resolved,
+    so tracking survives a later login rename."""
+    config, ctrl, recorder, monitor, eventsub = make_controller(tmp_path, channels=[])
+    ctrl.bind_live_check(_TwitchIds({"newch": "777"}), object())
+
+    text = asyncio.run(ctrl.handle_add(["twitch:newch"]))
+
+    assert text.startswith("Added twitch:newch")
+    assert "Twitch id 777" in text
+    assert config.channel_twitch_ids == {"twitch:newch": "777"}
+    assert read_file(tmp_path)["channel_twitch_ids"] == {"twitch:newch": "777"}
+
+
+def test_add_rejects_an_unknown_twitch_user(tmp_path):
+    """A login that Twitch does not know is not added: it could never
+    resolve to an id, so it could never be tracked."""
+    config, ctrl, recorder, monitor, eventsub = make_controller(tmp_path, channels=[])
+    ctrl.bind_live_check(_TwitchIds({}), object())
+
+    text = asyncio.run(ctrl.handle_add(["twitch:ghost"]))
+
+    assert "not found" in text
+    assert config.channels == []
+    assert eventsub.added == []
+
+
+def test_add_reports_the_channel_that_already_owns_the_id(tmp_path):
+    """A renamed account added under its new name resolves to the id
+    of the channel stored under the old name, so it is not added
+    twice."""
+    config, ctrl, recorder, monitor, eventsub = make_controller(tmp_path, channels=["twitch:old"])
+    config.channel_twitch_ids["twitch:old"] = "777"
+    ctrl.bind_live_check(_TwitchIds({"newname": "777"}), object())
+
+    text = asyncio.run(ctrl.handle_add(["twitch:newname"]))
+
+    assert "already monitored as twitch:old" in text
+    assert config.channels == ["twitch:old"]
+
+
+def test_remove_drops_the_stored_twitch_id(tmp_path):
+    """The id goes with the channel: Twitch recycles freed logins, so
+    a kept id would attach the old account to the name's next owner."""
+    config, ctrl, recorder, monitor, eventsub = make_controller(tmp_path, channels=["twitch:old"])
+    config.channel_twitch_ids["twitch:old"] = "777"
+
+    text = asyncio.run(ctrl.handle_remove(["twitch:old"]))
+
+    assert text.startswith("Removed twitch:old")
+    assert config.channel_twitch_ids == {}

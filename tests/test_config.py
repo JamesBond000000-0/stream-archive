@@ -11,10 +11,12 @@ from stream_archive.config import (
     AppConfig,
     api_base_url,
     apply_config_change,
+    channel_url,
     effective_quality,
     endpoint_base_url,
     get_config,
     normalize_channel_name,
+    rename_channel_key,
     save_config,
     webhook_public_url,
 )
@@ -908,3 +910,57 @@ def test_telegram_peers_normalize_keys():
 def test_telegram_peers_reject_a_zero_peer():
     with pytest.raises(ValueError, match="channel_telegram_peers"):
         build(channel_telegram_peers={"channel1": 0})
+
+
+def test_rename_channel_key_moves_every_per_channel_map():
+    """The rename helper moves the channel and all its per-channel
+    entries at once. A map left behind would attach the old name's
+    settings to a recycled login."""
+    config = _make_config(
+        channels=["twitch:old", "kick:xqc"],
+        channel_output_modes={"twitch:old": "telegram"},
+        channel_youtube_hold_seconds={"twitch:old": 30.0},
+        channel_youtube_vod_upload={"twitch:old": True},
+        channel_telegram_peers={"twitch:old": -1001},
+        channel_telegram_icon_urls={"twitch:old": "https://img.example/x.png"},
+        channel_preferred_qualities={"twitch:old": "720p"},
+        channel_categories={"twitch:old": ["Music"]},
+        channel_twitch_ids={"twitch:old": "4242"},
+    )
+
+    assert rename_channel_key(config, "twitch:old", "twitch:new") is True
+
+    assert config.channels == ["twitch:new", "kick:xqc"]
+    assert config.channel_output_modes == {"twitch:new": "telegram"}
+    assert config.channel_youtube_hold_seconds == {"twitch:new": 30.0}
+    assert config.channel_youtube_vod_upload == {"twitch:new": True}
+    assert config.channel_telegram_peers == {"twitch:new": -1001}
+    assert config.channel_telegram_icon_urls == {"twitch:new": "https://img.example/x.png"}
+    assert config.channel_preferred_qualities == {"twitch:new": "720p"}
+    assert config.channel_categories == {"twitch:new": ["Music"]}
+    assert config.channel_twitch_ids == {"twitch:new": "4242"}
+
+
+def test_rename_channel_key_refuses_a_taken_or_unknown_key():
+    """No move when the target is already monitored or the source is
+    not: the caller keeps tracking through the stored id instead."""
+    config = _make_config(channels=["twitch:old", "twitch:taken"], channel_twitch_ids={"twitch:old": "4242"})
+
+    assert rename_channel_key(config, "twitch:old", "twitch:taken") is False
+    assert rename_channel_key(config, "twitch:missing", "twitch:new") is False
+    assert rename_channel_key(config, "twitch:old", "twitch:old") is False
+    assert config.channels == ["twitch:old", "twitch:taken"]
+    assert config.channel_twitch_ids == {"twitch:old": "4242"}
+
+
+def test_channel_twitch_ids_reject_a_non_numeric_id():
+    with pytest.raises(ValueError, match="channel_twitch_ids"):
+        _make_config(channel_twitch_ids={"twitch:ch": "not-a-number"})
+
+
+def test_channel_url_prefers_the_given_login():
+    """The login override keeps links and resolves on the current name
+    while a stored key still holds the old one. Kick ignores it."""
+    assert channel_url("twitch:old") == "https://twitch.tv/old"
+    assert channel_url("twitch:old", "new") == "https://twitch.tv/new"
+    assert channel_url("kick:xqc", "ignored") == "https://kick.com/xqc"

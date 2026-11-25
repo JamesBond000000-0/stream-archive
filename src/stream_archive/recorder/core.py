@@ -143,10 +143,15 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, TelegramOut
         self._chat_paths = set()
 
     async def start(
-        self, channel: str, title: str | None = None, game: str | None = None, user_id: str | None = None
+        self,
+        channel: str,
+        title: str | None = None,
+        game: str | None = None,
+        user_id: str | None = None,
+        login: str | None = None,
     ) -> bool:
         async with self._lock_for(channel):
-            return await self._start_unlocked(channel, title=title, game=game, user_id=user_id)
+            return await self._start_unlocked(channel, title=title, game=game, user_id=user_id, login=login)
 
     async def reserve_start(self, channel: str) -> str | None:
         """Reserve recording/YT capacity atomically. Returns a block reason or None.
@@ -234,6 +239,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, TelegramOut
         user_id: str | None,
         safe_title: str,
         now: str,
+        login: str | None = None,
     ) -> None:
         """Attach the chat capture of a new recording to its entry.
 
@@ -245,7 +251,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, TelegramOut
             chat_dir = disk.chat_dir_path(self._config)
             chat_path = os.path.join(chat_dir, self._channel_dir(channel), f"{safe_title}-{now}.chat.json")
             chat_recorder = ChatRecorder(
-                bare_name(channel),
+                login or bare_name(channel),
                 chat_path,
                 stream_title,
                 stream_game,
@@ -290,6 +296,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, TelegramOut
         user_id: str | None = None,
         notify: bool = True,
         youtube_notify: bool = True,
+        login: str | None = None,
     ) -> bool:
         if channel in self._recordings:
             return True
@@ -324,7 +331,7 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, TelegramOut
 
         try:
             best, author, stream_title, stream_game = await loop.run_in_executor(
-                None, self._resolve_stream, channel, title, game
+                None, self._resolve_stream, channel, title, game, login
             )
         except NoStreamsError:
             logger.error(
@@ -366,8 +373,9 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, TelegramOut
             entry["title"] = title
             entry["game"] = game
             entry["user_id"] = user_id
+            entry["login"] = login
             entry["quality"] = effective_quality(self._config, channel)
-            live_url = channel_url(channel)
+            live_url = channel_url(channel, login)
 
             now = datetime.now(ZoneInfo(self._config.timezone)).strftime("%d_%m_%Y-%H%M%S")
             safe_title = sanitize_filename(stream_title)
@@ -421,7 +429,9 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, TelegramOut
                 del self._recordings[channel]
                 return False
 
-            self._start_chat_capture(entry, channel, stream_title, stream_game, author, user_id, safe_title, now)
+            self._start_chat_capture(
+                entry, channel, stream_title, stream_game, author, user_id, safe_title, now, login=login
+            )
 
             entry["tasks"] = tasks
 
@@ -557,9 +567,10 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, TelegramOut
             if entry is None:
                 return False
             title, game, user_id = entry.get("title"), entry.get("game"), entry.get("user_id")
+            login = entry.get("login")
             await self._stop_unlocked(channel)
             return await self._start_unlocked(
-                channel, title=title, game=game, user_id=user_id, notify=False, youtube_notify=True
+                channel, title=title, game=game, user_id=user_id, notify=False, youtube_notify=True, login=login
             )
 
     async def stop_all(self, *, finish_media: bool = True) -> None:

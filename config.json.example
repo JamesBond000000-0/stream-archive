@@ -27,6 +27,7 @@
     "telegram_recording_claims": [],
     "channel_preferred_qualities": {},
     "channel_categories": {},
+    "channel_twitch_ids": {},
     "eventsub": {
         "enabled": true
     },

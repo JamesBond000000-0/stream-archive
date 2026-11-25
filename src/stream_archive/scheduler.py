@@ -236,6 +236,7 @@ async def run_scheduler() -> None:
             telegram_streamer.set_profile_image_resolver(_profile_image_resolver(twitch_api, kick_api))
 
         eventsub = EventSubClient(twitch_api, monitor, config)
+        monitor.on_renamed = eventsub.rename_channel
         kick_webhook = KickWebhook(config, monitor, recorder, kick_api, notifier)
 
         updater = UpdateChecker(config, notifier, http=shared_http)

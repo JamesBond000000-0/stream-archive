@@ -124,6 +124,27 @@ class TwitchAPI:
             raise
         return resolved
 
+    async def resolve_user_logins(self, user_ids: list[str]) -> dict[str, str]:
+        """Map each Twitch user id to its current login.
+
+        The mirror of resolve_user_ids. A renamed account answers with
+        its new login under the same id. A deleted account is absent.
+        """
+        if not user_ids:
+            return {}
+        resolved: dict[str, str] = {}
+        try:
+            # Twitch rejects more than 100 ids in one request.
+            for start in range(0, len(user_ids), _MAX_QUERY_ITEMS):
+                chunk = user_ids[start : start + _MAX_QUERY_ITEMS]
+                resp = await self._request("GET", "https://api.twitch.tv/helix/users", params={"id": chunk})
+                resp.raise_for_status()
+                resolved.update({user["id"]: user["login"] for user in resp.json()["data"]})
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as e:
+            logger.error("[twitch_api] resolve_user_logins failed: %s", e)
+            raise
+        return resolved
+
     async def get_profile_image(self, username: str) -> str | None:
         """Profile image URL of one user, or None when the user is unknown.
 

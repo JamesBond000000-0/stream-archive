@@ -58,6 +58,7 @@ Keys marked **hand edit** stay read-only over the Telegram bot, the web panel, a
 | `preferred_quality` | no | `best` | Stream quality that the app requests from streamlink (`best`, `1080p`, `720p`, …, `audio_only`) |
 | `channel_preferred_qualities` | no | `{}` | Per-channel quality override, for example `{"twitch:channel": "720p"}`. Channels without an entry use `preferred_quality`. A bare key means `twitch:` |
 | `channel_categories` | no | `{}` | Per-channel category filter, for example `{"twitch:channel": ["Just Chatting", "Music"]}`. Channels without an entry record every live stream. A bare key means `twitch:`. The match ignores case. A blank live category never matches a filter. Hand edits skip the platform check below: the Telegram bot and the control API check each name and refuse unknown names |
+| `channel_twitch_ids` | no | `{}` | Monitored Twitch channel -> numeric Twitch user id. The app maintains this map: `/add` resolves the id, the monitor fills it in for older entries, and tracking follows the id, so a login rename moves the channel key to the new name on its own. Do not edit it by hand |
 | `max_concurrent_recordings` | no | `0` | Maximum simultaneous recordings. `0` means unlimited |
 | `max_concurrent_youtube_streams` | no | `0` | Maximum simultaneous YouTube restreams. `0` means unlimited |
 | `max_concurrent_telegram_streams` | no | `0` | Maximum simultaneous Telegram restreams. `0` means unlimited |

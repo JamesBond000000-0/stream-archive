@@ -136,11 +136,13 @@ class EventSubClient:
             async with self._subs_lock:
                 if self._subscribed_fully(channel):
                     continue
-            try:
-                uid = (await self._api.resolve_user_ids([bare_name(channel)])).get(bare_name(channel))
-            except Exception as e:
-                logger.error("[eventsub] resolve_user_ids failed for %s: %s", channel, e)
-                continue
+            uid = self._config.channel_twitch_ids.get(channel)
+            if uid is None:
+                try:
+                    uid = (await self._api.resolve_user_ids([bare_name(channel)])).get(bare_name(channel))
+                except Exception as e:
+                    logger.error("[eventsub] resolve_user_ids failed for %s: %s", channel, e)
+                    continue
             if uid is None:
                 logger.warning("[eventsub] could not resolve user id for %s, skipping", channel)
                 continue
@@ -152,6 +154,21 @@ class EventSubClient:
                 # entry reads as not subscribed, so a later pass retries it.
                 # A skipped entry would hide the channel from every retry.
                 self._subs.setdefault(channel, {}).update(created)
+
+    async def rename_channel(self, old: str, new: str) -> None:
+        """Re-key the subscription maps after a Twitch login rename.
+
+        The subscriptions name user ids, so they stay valid. Only the
+        channel key changes. The monitor calls this after it moved the
+        config key.
+        """
+        async with self._subs_lock:
+            if old in self._subs:
+                self._subs[new] = self._subs.pop(old)
+            uid = self._user_ids.pop(old, None)
+            if uid is not None:
+                self._user_ids[new] = uid
+                self._id_to_channel[uid] = new
 
     async def remove_channel(self, channel: str) -> None:
         await self._remove_channels([channel])
@@ -328,13 +345,16 @@ class EventSubClient:
 
     async def _subscribe_all(self) -> None:
         channels = [c for c in self._config.channels if not is_kick_channel(c)]
-        try:
-            resolved = await self._api.resolve_user_ids([bare_name(c) for c in channels])
-        except Exception as e:
-            logger.error("[eventsub] resolve_user_ids failed: %s", e)
-            resolved = {}
-        identity_by_bare = {bare_name(c): c for c in channels}
-        user_ids = {identity_by_bare[bare]: uid for bare, uid in resolved.items() if bare in identity_by_bare}
+        user_ids = {c: self._config.channel_twitch_ids[c] for c in channels if c in self._config.channel_twitch_ids}
+        unstored = [c for c in channels if c not in user_ids]
+        if unstored:
+            try:
+                resolved = await self._api.resolve_user_ids([bare_name(c) for c in unstored])
+            except Exception as e:
+                logger.error("[eventsub] resolve_user_ids failed: %s", e)
+                resolved = {}
+            identity_by_bare = {bare_name(c): c for c in unstored}
+            user_ids.update({identity_by_bare[bare]: uid for bare, uid in resolved.items() if bare in identity_by_bare})
         # Every network call stays outside _subs_lock. The lock covers the
         # three maps only, so add_channel, remove_channel, and sync_channels
         # never wait for the subscription round trips of every channel.
@@ -614,7 +634,12 @@ class EventSubClient:
                     logger.debug("[eventsub] %s already offline, ignoring", channel)
                     return
                 await self._monitor.handle_online(
-                    channel, stream.get("title"), stream.get("game_name"), user_id, self._config
+                    channel,
+                    stream.get("title"),
+                    stream.get("game_name"),
+                    user_id,
+                    self._config,
+                    login=stream.get("user_login"),
                 )
             elif sub_type == "stream.offline":
                 await self._monitor.handle_offline(channel, self._config)

@@ -8,7 +8,15 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from stream_archive import disk
-from stream_archive.config import AppConfig, bare_name, category_allowed, is_kick_channel
+from stream_archive.config import (
+    TWITCH_PREFIX,
+    AppConfig,
+    apply_config_change,
+    bare_name,
+    category_allowed,
+    is_kick_channel,
+    rename_channel_key,
+)
 from stream_archive.health import clear_degraded, set_degraded
 
 if TYPE_CHECKING:
@@ -41,11 +49,17 @@ class Monitor:
         #: Called with (channel, filepath) after a recording stops cleanly.
         #: The scheduler sets it to start per-channel YouTube auto-uploads.
         self.on_stopped: Any = on_stopped
+        #: Called with (old, new) after a Twitch channel key moved to a
+        #: new login. The scheduler sets it to re-key the EventSub maps.
+        self.on_renamed: Any = None
         self._live_channels: set[str] = set()
         self._last_failure_notify: dict[str, float] = {}
         self._last_disk_notify: dict[str, float] = {}  # blocked-start alerts, per channel
         self._locks: dict[str, asyncio.Lock] = {}
         self._warned_unknown_kick: set[str] = set()
+        self._warned_unknown_twitch: set[str] = set()
+        self._rename_deferred: set[str] = set()
+        self._id_store_failed = False
         self._kick_api_error_logged = False
         self._twitch_auth_alerted = False
         self._kick_auth_alerted = False
@@ -62,18 +76,19 @@ class Monitor:
             self._clear_twitch_auth()
         else:
             twitch_ok = True
+            user_ids: dict[str, str] = {}
+            current_logins: dict[str, str] = {}
             try:
-                resolved = await twitch_api.resolve_user_ids([bare_name(c) for c in twitch_channels])
+                user_ids, current_logins, twitch_channels = await self._resolve_twitch_identities(
+                    twitch_api, config, twitch_channels
+                )
             except (httpx.HTTPError, TimeoutError, ValueError, KeyError) as e:
-                logger.error("[monitor] resolve_user_ids failed: %s", e)
+                logger.error("[monitor] Twitch identity resolve failed: %s", e)
                 await self._note_twitch_error(e)
-                resolved = {}
                 twitch_ok = False
-            if not resolved:
+            if not user_ids:
                 logger.warning("[monitor] Failed to resolve user IDs")
             else:
-                identity_by_bare = {bare_name(c): c for c in twitch_channels}
-                user_ids = {identity_by_bare[bare]: uid for bare, uid in resolved.items() if bare in identity_by_bare}
                 # If get_live_streams fails, treat the result as unknown, not
                 # empty. Otherwise the sweep below stops every live recording
                 # during an API outage. Leave streams unset and skip both loops.
@@ -106,6 +121,7 @@ class Monitor:
                             game,
                             user_id,
                             config,
+                            login=stream.get("user_login") or current_logins.get(channel),
                         )
 
                     for channel in twitch_channels:
@@ -159,8 +175,129 @@ class Monitor:
                     elif ch in self._live_channels:
                         await self._ensure_stopped(ch, config)
 
+    async def _resolve_twitch_identities(
+        self, twitch_api: TwitchAPI, config: AppConfig, channels: list[str]
+    ) -> tuple[dict[str, str], dict[str, str], list[str]]:
+        """Resolve the Twitch user id and the current login of each channel.
+
+        A channel with a stored id resolves by id, so a login rename
+        keeps tracking: the stored key moves to the new login in the
+        same pass, unless a recording runs under the old key, which
+        defers the move. A channel without a stored id resolves by
+        login once, and the id is stored for the next passes.
+
+        Returns (user_ids, current_logins, channels) keyed by the
+        channel keys in force after any rename. A stored id that
+        Twitch no longer knows (a deleted account) drops the channel
+        from both maps, so it neither starts nor stops: fail-open,
+        like an unknown login.
+        """
+        stored = {ch: config.channel_twitch_ids[ch] for ch in channels if ch in config.channel_twitch_ids}
+        logins_by_id: dict[str, str] = {}
+        if stored:
+            logins_by_id = await twitch_api.resolve_user_logins(list(stored.values()))
+        ids_by_login: dict[str, str] = {}
+        unstored = [ch for ch in channels if ch not in stored]
+        if unstored:
+            ids_by_login = await twitch_api.resolve_user_ids([bare_name(c) for c in unstored])
+
+        user_ids: dict[str, str] = {}
+        current_logins: dict[str, str] = {}
+        backfill: dict[str, str] = {}
+        renames: dict[str, str] = {}
+        for channel in channels:
+            stored_id = stored.get(channel)
+            if stored_id is None:
+                uid = ids_by_login.get(bare_name(channel))
+                if uid is not None:
+                    user_ids[channel] = uid
+                    backfill[channel] = uid
+                continue
+            login = logins_by_id.get(stored_id)
+            if login is None:
+                if channel not in self._warned_unknown_twitch:
+                    self._warned_unknown_twitch.add(channel)
+                    logger.warning(
+                        "[monitor] Twitch user id %s of %s not found (account deleted?), skipping",
+                        stored_id,
+                        channel,
+                    )
+                continue
+            self._warned_unknown_twitch.discard(channel)
+            user_ids[channel] = stored_id
+            current_logins[channel] = login
+            if login == bare_name(channel):
+                self._rename_deferred.discard(channel)
+                continue
+            new_channel = f"{TWITCH_PREFIX}{login}"
+            if channel in self._live_channels or self.recorder.is_recording(channel):
+                if channel not in self._rename_deferred:
+                    self._rename_deferred.add(channel)
+                    logger.info(
+                        "[monitor] %s renamed to %s (id %s); the key moves after the recording ends",
+                        channel,
+                        new_channel,
+                        stored_id,
+                    )
+            elif new_channel in config.channels:
+                logger.warning(
+                    "[monitor] %s renamed to %s, but that name is already monitored; keeping the old key",
+                    channel,
+                    new_channel,
+                )
+            else:
+                renames[channel] = new_channel
+
+        applied: dict[str, str] = {}
+        if backfill or renames:
+
+            def mutate(candidate: AppConfig) -> None:
+                for ch, uid in backfill.items():
+                    candidate.channel_twitch_ids.setdefault(ch, uid)
+                for old, new in renames.items():
+                    rename_channel_key(candidate, old, new)
+
+            try:
+                apply_config_change(config, mutate)
+            except Exception:
+                # The in-memory maps of this pass still track by id. The
+                # store retries on the next pass, but a broken store logs
+                # its traceback once, not every pass.
+                if self._id_store_failed:
+                    logger.debug("[monitor] Twitch user id store still failing")
+                else:
+                    self._id_store_failed = True
+                    logger.error("[monitor] failed to store Twitch user ids", exc_info=True)
+            else:
+                self._id_store_failed = False
+                applied = renames
+                for old, new in renames.items():
+                    user_ids[new] = user_ids.pop(old)
+                    current_logins[new] = current_logins.pop(old)
+                    self._rename_deferred.discard(old)
+                    logger.info("[monitor] %s renamed to %s (id %s)", old, new, user_ids[new])
+                    if self.on_renamed is not None:
+                        try:
+                            await self.on_renamed(old, new)
+                        except Exception:
+                            logger.error("[monitor] rename callback failed for %s", old, exc_info=True)
+                    try:
+                        await self.notifier.notify(
+                            f"\u2139\ufe0f Twitch channel renamed: {old} \u2192 {new}. Tracking continues."
+                        )
+                    except Exception:
+                        logger.error("[monitor] rename notification failed for %s", old, exc_info=True)
+        channels = [applied.get(ch, ch) for ch in channels]
+        return user_ids, current_logins, channels
+
     async def handle_online(
-        self, channel: str, title: str | None, game: str | None, user_id: str | None, config: AppConfig
+        self,
+        channel: str,
+        title: str | None,
+        game: str | None,
+        user_id: str | None,
+        config: AppConfig,
+        login: str | None = None,
     ) -> None:
         """EventSub stream.online entry point."""
         if channel not in config.channels:
@@ -170,7 +307,7 @@ class Monitor:
             if channel in self._live_channels:
                 await self._ensure_stopped(channel, config)
             return
-        await self._ensure_recording(channel, title, game, user_id, config)
+        await self._ensure_recording(channel, title, game, user_id, config, login=login)
 
     async def handle_offline(self, channel: str, config: AppConfig) -> None:
         """EventSub stream.offline entry point."""
@@ -179,7 +316,13 @@ class Monitor:
         await self._ensure_stopped(channel, config)
 
     async def _ensure_recording(
-        self, channel: str, title: str | None, game: str | None, user_id: str | None, config: AppConfig
+        self,
+        channel: str,
+        title: str | None,
+        game: str | None,
+        user_id: str | None,
+        config: AppConfig,
+        login: str | None = None,
     ) -> None:
         """Start or restart the recording for a live channel."""
         async with self._lock_for(channel):
@@ -210,7 +353,7 @@ class Monitor:
             await self._notify_blocked(channel, reserve_reason)
             return
         try:
-            ok = await self.recorder.start(channel, title=title, game=game, user_id=user_id)
+            ok = await self.recorder.start(channel, title=title, game=game, user_id=user_id, login=login)
         finally:
             self.recorder.release_start(channel)
         removed = False
@@ -303,6 +446,8 @@ class Monitor:
         """
         self._last_failure_notify.pop(channel, None)
         self._last_disk_notify.pop(channel, None)
+        self._warned_unknown_twitch.discard(channel)
+        self._rename_deferred.discard(channel)
         # bare_name strips the twitch: prefix too, so a Twitch channel
         # must not evict the entry that belongs to kick:<name>.
         if is_kick_channel(channel):
