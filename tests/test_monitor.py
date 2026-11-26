@@ -5,6 +5,7 @@ import time
 import httpx
 from conftest import make_config
 
+import stream_archive.monitor as monitor_module
 from stream_archive.config import get_config
 from stream_archive.monitor import Monitor
 from stream_archive.recorder.core import _ENDED_CLEAN_GRACE_S
@@ -235,6 +236,41 @@ def test_recording_death_of_another_channel_does_not_restart_this_one():
 
     # Only the dead channel restarts. A global liveness flag would skip it.
     assert rec.started == ["twitch:b"]
+
+
+def test_hung_start_does_not_stall_the_pass(monkeypatch, caplog):
+    """One hung start must not block the rest of the pass.
+
+    The pass walks the live channels one by one. A start can hang in
+    stream resolution (a half-open proxy connection). Before the pass
+    had a per-channel deadline, that one start stalled every later
+    channel: their dead recordings never restarted.
+    """
+
+    class HangingRecorder(FakeRecorder):
+        async def start(self, channel, title=None, game=None, user_id=None, login=None):
+            if channel == "twitch:aaa":
+                await asyncio.sleep(3600)
+            return await super().start(channel, title=title, game=game, user_id=user_id, login=login)
+
+    rec = HangingRecorder()
+    api = FakeTwitchAPI(
+        streams={"u1": {"title": "T", "game_name": "G"}, "u2": {"title": "T", "game_name": "G"}},
+        user_ids={"aaa": "u1", "bbb": "u2"},
+    )
+    mon = make_monitor(recorder=rec)
+    config = make_config(channels=["aaa", "bbb"])
+    mon._live_channels.add("twitch:bbb")  # bbb is live with a dead recording
+    monkeypatch.setattr(monitor_module, "SUPERVISION_TIMEOUT_S", 0.2, raising=False)
+
+    async def one_pass():
+        await asyncio.wait_for(mon.check_channels(api, FakeKickAPI(), config), timeout=5)
+
+    with caplog.at_level("WARNING", logger="stream_archive.monitor"):
+        asyncio.run(one_pass())
+
+    assert rec.started == ["twitch:bbb"]
+    assert "twitch:aaa step timed out" in caplog.text
 
 
 def test_clean_end_skips_restart_until_offline(caplog):
