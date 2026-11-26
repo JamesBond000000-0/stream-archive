@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Coroutine
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -29,6 +30,13 @@ logger = logging.getLogger(__name__)
 
 FAILURE_NOTIFY_INTERVAL = 1800
 DISK_NOTIFY_INTERVAL = 1800
+
+#: Deadline for one channel's start or stop step inside a poll pass.
+#: The pass walks the channels one by one, and a start can hang in
+#: stream resolution or in a Telegram call. Without a deadline one
+#: hung channel stalls the whole pass: later channels never run, and
+#: their dead recordings never restart.
+SUPERVISION_TIMEOUT_S = 240.0
 
 #: Free archive space below which no recording starts, in GiB. The disk cap
 #: bounds the archive; this floor bounds the filesystem, so a full disk
@@ -66,6 +74,23 @@ class Monitor:
 
     def _lock_for(self, channel: str) -> asyncio.Lock:
         return self._locks.setdefault(channel, asyncio.Lock())
+
+    async def _supervise(self, channel: str, step: Coroutine[Any, Any, None]) -> None:
+        """Run one channel's start or stop step under the pass deadline.
+
+        A timeout drops the step for this pass only. The next pass
+        retries the channel, and the other channels in this pass
+        still run.
+        """
+        try:
+            async with asyncio.timeout(SUPERVISION_TIMEOUT_S):
+                await step
+        except TimeoutError:
+            logger.warning(
+                "[monitor] %s step timed out after %gs, skipping it for this pass",
+                channel,
+                SUPERVISION_TIMEOUT_S,
+            )
 
     async def check_channels(self, twitch_api: TwitchAPI, kick_api: KickAPI, config: AppConfig) -> None:
         # Policy asymmetry. Unknown Twitch users are skipped with a
@@ -113,15 +138,18 @@ class Monitor:
                         if not category_allowed(config, channel, game):
                             logger.info("[monitor] %s live in category %r, not in filter - skipping", channel, game)
                             if channel in self._live_channels:
-                                await self._ensure_stopped(channel, config)
+                                await self._supervise(channel, self._ensure_stopped(channel, config))
                             continue
-                        await self._ensure_recording(
+                        await self._supervise(
                             channel,
-                            stream.get("title"),
-                            game,
-                            user_id,
-                            config,
-                            login=stream.get("user_login") or current_logins.get(channel),
+                            self._ensure_recording(
+                                channel,
+                                stream.get("title"),
+                                game,
+                                user_id,
+                                config,
+                                login=stream.get("user_login") or current_logins.get(channel),
+                            ),
                         )
 
                     for channel in twitch_channels:
@@ -130,7 +158,7 @@ class Monitor:
                             if not uid:
                                 logger.warning("[monitor] stream without user_id, skipping stop")
                                 continue
-                            await self._ensure_stopped(channel, config)
+                            await self._supervise(channel, self._ensure_stopped(channel, config))
 
             if twitch_ok:
                 self._clear_twitch_auth()
@@ -162,18 +190,18 @@ class Monitor:
                             logger.warning("[monitor] kick channel not found: %s", ch)
                             logger.warning("[monitor] fail-closed policy: unknown kick slug counts as offline: %s", ch)
                         if ch in self._live_channels:
-                            await self._ensure_stopped(ch, config)
+                            await self._supervise(ch, self._ensure_stopped(ch, config))
                     elif status.get("is_live"):
                         # Fail-closed. A payload without is_live counts as offline.
                         game = status.get("game")
                         if not category_allowed(config, ch, game):
                             logger.info("[monitor] %s live in category %r, not in filter - skipping", ch, game)
                             if ch in self._live_channels:
-                                await self._ensure_stopped(ch, config)
+                                await self._supervise(ch, self._ensure_stopped(ch, config))
                             continue
-                        await self._ensure_recording(ch, status.get("title"), game, None, config)
+                        await self._supervise(ch, self._ensure_recording(ch, status.get("title"), game, None, config))
                     elif ch in self._live_channels:
-                        await self._ensure_stopped(ch, config)
+                        await self._supervise(ch, self._ensure_stopped(ch, config))
 
     async def _resolve_twitch_identities(
         self, twitch_api: TwitchAPI, config: AppConfig, channels: list[str]

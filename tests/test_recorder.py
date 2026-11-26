@@ -678,6 +678,27 @@ def test_failed_task_end_not_flagged_clean(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_start_fails_when_resolution_passes_its_deadline(tmp_path, monkeypatch):
+    """A stream resolution that never returns must fail the start.
+
+    Resolution talks to Twitch through proxies, and a half-open
+    connection can hold it forever. Before the start had a deadline,
+    the monitor pass that called it stalled with it, and every other
+    channel waited behind it.
+    """
+    rec = make_recorder(tmp_path, monkeypatch, output_mode="disk")
+    gate = threading.Event()
+    monkeypatch.setattr(rec, "_resolve_stream", lambda *a: gate.wait(30))
+    monkeypatch.setattr("stream_archive.recorder.core._RESOLVE_TIMEOUT_S", 0.2, raising=False)
+
+    async def scenario():
+        ok = await asyncio.wait_for(rec.start("ch"), timeout=5)
+        assert ok is False
+        assert "ch" not in rec._recordings
+
+    asyncio.run(scenario())
+
+
 def test_clean_end_flag_cleared_on_restart(tmp_path, monkeypatch):
     rec = make_recorder(tmp_path, monkeypatch, stream=SustainedStream, output_mode="disk")
 

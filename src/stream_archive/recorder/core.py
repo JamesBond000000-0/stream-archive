@@ -55,6 +55,11 @@ logger = logging.getLogger(__name__)
 # A clean feed end suppresses monitor restarts until the offline webhook or API
 _ENDED_CLEAN_GRACE_S = 600.0
 
+#: Deadline for one stream resolution at start. Resolution talks to
+#: Twitch through proxies, and a half-open connection can hold it
+#: forever. The start fails at the deadline instead of hanging.
+_RESOLVE_TIMEOUT_S = 120.0
+
 
 def _require_filepath(entry: Recording, channel: str) -> str:
     """Filepath for a disk recording. Raise when the path is missing."""
@@ -330,9 +335,22 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, TelegramOut
         loop = asyncio.get_running_loop()
 
         try:
-            best, author, stream_title, stream_game = await loop.run_in_executor(
-                None, self._resolve_stream, channel, title, game, login
+            best, author, stream_title, stream_game = await asyncio.wait_for(
+                loop.run_in_executor(None, self._resolve_stream, channel, title, game, login),
+                timeout=_RESOLVE_TIMEOUT_S,
             )
+        except TimeoutError:
+            # The worker thread may stay stuck inside the plugin. The
+            # start must not wait for it: a start that never returns
+            # stalls the monitor pass that called it, and every other
+            # channel waits behind it. Fail the start. The monitor
+            # retries on the next pass.
+            logger.error(
+                "[recorder] [%s] Stream resolution timed out after %gs. Will retry on the next check.",
+                channel,
+                _RESOLVE_TIMEOUT_S,
+            )
+            return False
         except NoStreamsError:
             logger.error(
                 "[recorder] [%s] No streams available (ad-block proxies exhausted or stream not ready). Will retry on the next check.",
