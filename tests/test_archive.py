@@ -96,6 +96,42 @@ def test_build_playlist_swaps_only_unavailable_unmuted_segments():
     ]
 
 
+PLAYLIST_FMP4 = """#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-TARGETDURATION:10
+#EXT-X-MAP:URI="init-0.mp4"
+#EXTINF:10.0,
+0-unmuted.mp4
+#EXTINF:10.0,
+1-unmuted.mp4
+#EXTINF:10.0,
+2.mp4
+#EXT-X-ENDLIST
+"""
+
+
+def test_build_playlist_makes_the_fmp4_init_segment_absolute():
+    # Regression: ffmpeg resolves the EXT-X-MAP URI next to the local
+    # playlist file. A relative init segment means the capture reads
+    # nothing at all.
+    text, swapped = build_playlist(PLAYLIST_FMP4, "https://cdn.example/base/chunked", {"1-unmuted.mp4"})
+    assert swapped == 1
+    assert '#EXT-X-MAP:URI="https://cdn.example/base/chunked/init-0.mp4"' in text.splitlines()
+    segments = [
+        line
+        for line in text.splitlines()
+        if line.startswith("https://cdn.example")
+        and "/chunked/" in line
+        and line.endswith(".mp4")
+        and "init" not in line
+    ]
+    assert segments == [
+        "https://cdn.example/base/chunked/0-unmuted.mp4",
+        "https://cdn.example/base/chunked/1-muted.mp4",
+        "https://cdn.example/base/chunked/2.mp4",
+    ]
+
+
 def test_ledger_entry_round_trip_marks_the_vod_done():
     entry = format_ledger_entry(
         vod_id="2941241699",
@@ -208,11 +244,11 @@ def vod(vod_id, created_at, duration="0h0m1s"):
     }
 
 
-def make_service(tmp_path, *, videos, ledger_texts=(), recorder=None, gone=("0-unmuted.ts",)):
+def make_service(tmp_path, *, videos, ledger_texts=(), recorder=None, gone=("0-unmuted.ts",), playlist=PLAYLIST):
     def handler(request):
         path = request.url.path
         if path.endswith("/index-dvr.m3u8"):
-            return httpx.Response(200, text=PLAYLIST)
+            return httpx.Response(200, text=playlist)
         name = path.rsplit("/", 1)[-1]
         if name in gone:
             return httpx.Response(403, text="gone")
@@ -269,6 +305,22 @@ def test_run_archives_only_vods_missing_from_the_ledger(tmp_path):
     assert "/chunked/0-muted.ts" in built
     assert "/chunked/1-unmuted.ts" in built
     assert any("Archived someone" in message for message in notifier.messages)
+
+
+def test_run_keeps_fmp4_unmuted_segments_that_still_load(tmp_path):
+    # An fMP4 VOD keeps its unmuted segments: every probe answers,
+    # so the built playlist keeps the original names, and its init
+    # segment is absolute.
+    videos = [vod("5", "2026-11-26T00:00:00Z")]
+    service, ledger, _, factory, _ = make_service(tmp_path, videos=videos, gone=(), playlist=PLAYLIST_FMP4)
+
+    run_to_finish(service)
+
+    assert parse_ledger_ids(ledger.posted) == {"5"}
+    built = factory.playlists["5.m3u8"]
+    assert "/chunked/0-unmuted.mp4" in built
+    assert "/chunked/1-unmuted.mp4" in built
+    assert 'URI="https://' in built
 
 
 def test_run_keeps_a_failed_vod_out_of_the_ledger(tmp_path):

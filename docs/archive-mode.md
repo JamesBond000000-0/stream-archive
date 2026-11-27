@@ -15,10 +15,10 @@ A run takes real time: a 5-hour VOD takes 5 hours to archive. Runs are serial, o
 
 The rebuild uses the recovery layout on the Twitch CDN. The VOD thumbnail URL names the CDN host and the storage path, and the DVR playlist under that path lists the original segments.
 
-Twitch mutes some VOD ranges for the public player. In the DVR playlist, a muted range's segment is named `<n>-unmuted.ts` and holds the original audio. Twitch deletes that original soon after the mute. The app probes each unmuted segment before it starts:
+Twitch mutes some VOD ranges for the public player. In the DVR playlist, a muted range's segment is named `<n>-unmuted.ts` or `<n>-unmuted.mp4` and holds the original audio. Whether that original still loads depends on the storage format: VODs stored as fragmented MP4 keep it, VODs stored as MPEG-TS do not. The app probes each unmuted segment before it starts:
 
 - The segment still loads: the archive gets the original audio.
-- The segment is gone: the muted twin `<n>-muted.ts` takes its place, so the archive still holds the full timeline.
+- The segment is gone: the muted twin (the same name with `-muted`) takes its place, so the archive still holds the full timeline.
 
 The start and finish messages say how many segments fell back to the muted audio.
 

@@ -11,13 +11,14 @@ rebuilt playlist at native speed and writes MPEG-TS to a pipe.
 A VOD's playlist comes from the recovery layout on the Twitch CDN.
 The VOD thumbnail URL names the CDN host and the storage path. The
 DVR playlist under that path lists the original segments. A segment
-Twitch muted for the public player appears as ``<n>-unmuted.ts``
-there, while the public playlist serves ``<n>-muted.ts`` instead.
-Twitch deletes the original segment of a muted range soon after the
-mute, so the module probes each unmuted segment and falls back to
-the muted segment where the original is gone. The archive then
-always holds the full timeline, with the original audio wherever
-Twitch still serves it.
+Twitch muted for the public player appears as ``<n>-unmuted.<ext>``
+there, while the public playlist serves ``<n>-muted.<ext>`` instead.
+Whether the original still loads depends on the storage format:
+VODs stored as fragmented MP4 keep their unmuted segments, VODs
+stored as MPEG-TS do not. The module probes each unmuted segment
+and falls back to the muted segment where the original is gone.
+The archive then always holds the full timeline, with the original
+audio wherever Twitch still serves it.
 """
 
 from __future__ import annotations
@@ -92,23 +93,34 @@ def playlist_segments(playlist_text: str) -> list[str]:
     return [line.strip() for line in playlist_text.splitlines() if line.strip() and not line.startswith("#")]
 
 
+_MAP_URI_RE = re.compile(r'^(#EXT-X-MAP:URI=")([^"]+)(".*)$')
+
+
 def build_playlist(playlist_text: str, base_url: str, unavailable_unmuted: set[str]) -> tuple[str, int]:
     """Rewrite a DVR playlist as a local file with absolute URLs.
 
     Each unavailable unmuted segment swaps for its muted twin, which
-    the public player serves and Twitch keeps. Returns the new text
-    and the swap count.
+    the public player serves and Twitch keeps. A fragmented-MP4
+    playlist also names its init segment in an ``#EXT-X-MAP`` tag;
+    that URI turns absolute too, or ffmpeg looks for the file next
+    to the local playlist. Returns the new text and the swap count.
     """
     out: list[str] = []
     swapped = 0
     for raw in playlist_text.splitlines():
         line = raw.strip()
-        if not line or line.startswith("#"):
+        if not line:
             out.append(raw)
             continue
+        if line.startswith("#"):
+            map_match = _MAP_URI_RE.match(line)
+            if map_match is not None and "/" not in map_match.group(2):
+                line = f"{map_match.group(1)}{base_url}/{map_match.group(2)}{map_match.group(3)}"
+            out.append(line)
+            continue
         name = line.rsplit("/", 1)[-1]
-        if name in unavailable_unmuted and name.endswith("-unmuted.ts"):
-            name = name[: -len("-unmuted.ts")] + "-muted.ts"
+        if name in unavailable_unmuted and "-unmuted." in name:
+            name = name.replace("-unmuted.", "-muted.", 1)
             swapped += 1
         out.append(f"{base_url}/{name}")
     return "\n".join(out) + "\n", swapped
@@ -441,7 +453,7 @@ class ArchiveService:
         if not segments:
             logger.warning("[archive] playlist for VOD %s lists no segments", vod_id)
             return None
-        unmuted = [name for name in segments if name.endswith("-unmuted.ts")]
+        unmuted = [name for name in segments if "-unmuted." in name]
         unavailable: set[str] = set()
         if unmuted:
             unavailable = await self._probe_unavailable(location, quality, unmuted)
