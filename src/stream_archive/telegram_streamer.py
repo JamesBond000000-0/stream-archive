@@ -329,6 +329,63 @@ class TelegramLiveStreamer:
             logger.info("[telegram_live] Created Telegram channel %s for %s", peer, channel)
             return peer
 
+    async def ensure_ledger_channel(self) -> int:
+        """Peer id of the archive ledger channel.
+
+        A stored peer id wins. Without one, the app creates a private
+        broadcast channel with the configured title and stores its
+        peer id in the config at once, like a restream destination.
+        """
+        peer = self._config.archive.ledger_peer_id
+        if peer:
+            return peer
+        async with self._create_lock:
+            # A second caller can land here while the first one creates.
+            # Read the stored peer again inside the lock.
+            peer = self._config.archive.ledger_peer_id
+            if peer:
+                return peer
+            client = await self.connect()
+            from telethon.tl.functions.channels import CreateChannelRequest
+
+            title = sanitize_metadata_text(self._config.archive.ledger_channel_title, limit=128)
+            about = "Finished VODs of StreamArchive archive mode. One message per VOD."
+            try:
+                result = await client(CreateChannelRequest(broadcast=True, title=title, about=about))
+            except Exception as e:
+                msg = f"Telegram ledger channel create failed: {e}"
+                raise RuntimeError(msg) from e
+            chat = _channel_from_result(result)
+            raw_id = getattr(chat, "id", None)
+            if not isinstance(raw_id, int):
+                msg = f"Telegram ledger channel create returned no channel id: {result!r}"
+                raise RuntimeError(msg)
+            peer = marked_peer_id(raw_id)
+
+            def store(cfg: AppConfig) -> None:
+                cfg.archive.ledger_peer_id = peer
+
+            apply_config_change(self._config, store)
+            logger.info("[telegram_live] Created archive ledger channel %s", peer)
+            return peer
+
+    async def read_ledger_texts(self, limit: int = 10000) -> list[str]:
+        """Message texts of the ledger channel, newest first."""
+        peer = await self.ensure_ledger_channel()
+        client = await self.connect()
+        texts: list[str] = []
+        async for message in client.iter_messages(peer, limit=limit):
+            text = getattr(message, "message", None)
+            if isinstance(text, str) and text:
+                texts.append(text)
+        return texts
+
+    async def post_ledger_entry(self, text: str) -> None:
+        """Append one entry message to the ledger channel."""
+        peer = await self.ensure_ledger_channel()
+        client = await self.connect()
+        await client.send_message(peer, text)
+
     async def _apply_channel_icon(self, channel: str, peer_id: int) -> None:
         """Set the Telegram channel photo from the broadcaster's icon. Never raises.
 

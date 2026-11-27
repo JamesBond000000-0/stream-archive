@@ -158,6 +158,60 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, TelegramOut
         async with self._lock_for(channel):
             return await self._start_unlocked(channel, title=title, game=game, user_id=user_id, login=login)
 
+    async def start_archive(
+        self,
+        key: str,
+        author: str,
+        title: str,
+        game: str,
+        stream: Any,
+        *,
+        part_seconds: float = 0,
+    ) -> tuple[asyncio.Task[Any], Recording] | None:
+        """Start one archive capture: a fixed source restreamed to YouTube.
+
+        Archive mode feeds a past VOD, not a live channel, so this path
+        skips the live work: no stream resolution, no chat capture, no
+        notifications, no growth watchdog. It registers the entry the
+        YouTube output needs, with the archive flags set, and returns
+        the capture task plus the entry. The caller awaits the task,
+        then reads ``youtube_parts`` and ``failed`` from the entry once
+        the entry leaves the active set. ``key`` must be a synthetic
+        channel key that no live channel uses. None means the capture
+        did not start.
+        """
+        if self._youtube is None:
+            logger.error("[recorder] [%s] Archive capture needs a YouTube streamer. Check the YouTube settings.", key)
+            return None
+        async with self._lock_for(key):
+            if key in self._recordings:
+                return None
+            entry: Recording = {
+                "tasks": [],
+                "youtube_info": None,
+                "telegram_info": None,
+                "filepath": None,
+                "started_at": time.monotonic(),
+                "mode": "youtube",
+                "archive": True,
+                "part_seconds": part_seconds,
+                "youtube_parts": [],
+                "title": title,
+                "game": game,
+            }
+            self._recordings[key] = entry
+            try:
+                task = self._track(
+                    key,
+                    self._stream_youtube(key, author, title, game, stream, None, notify=False, youtube_notify=False),
+                )
+            except BaseException:
+                self._recordings.pop(key, None)
+                raise
+            entry["tasks"] = [task]
+            logger.info("[recorder] Started archive capture %s", key)
+            return task, entry
+
     async def reserve_start(self, channel: str) -> str | None:
         """Reserve recording/YT capacity atomically. Returns a block reason or None.
 
@@ -750,7 +804,9 @@ class Recorder(StreamlinkMixin, DiskOutputMixin, YoutubeOutputMixin, TelegramOut
             if wd is not None:
                 wd.cancel()
             await self._finalize_entry(channel, entry, entry.pop("chat_recorder", None))
-            if entry.get("mode") in ("youtube", "both"):
+            if entry.get("mode") in ("youtube", "both") and not entry.get("archive"):
+                # Archive keys are synthetic and never monitored, so a
+                # quick-end backoff for one would never be read.
                 self._note_youtube_end(channel, entry)
             if clean:
                 # Remember the finalized filepath with the clean stamp. The

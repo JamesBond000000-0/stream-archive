@@ -486,6 +486,43 @@ class TelegramLiveConfig(BaseModel):
         return self
 
 
+class ArchiveConfig(BaseModel):
+    """Archive mode: save a channel's past broadcasts to YouTube.
+
+    The ``/archive`` command lists the channel's VODs, rebuilds each
+    VOD's playlist on the Twitch CDN (the recovery layout, with the
+    original audio where Twitch still serves it), and restreams each
+    VOD to YouTube in real time. A Telegram channel acts as the ledger
+    of finished VODs, so a later run skips them. The ledger needs the
+    Telegram live user session, so this mode needs ``telegram_live``
+    on. It also needs YouTube set up.
+    """
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    enabled: StrictBool = False
+    #: Title of the Telegram channel that holds one message per
+    #: finished VOD. The app creates the channel on first use and
+    #: stores its peer id in ``ledger_peer_id`` at once.
+    ledger_channel_title: str = Field("Stream Archive Ledger", min_length=1)
+    #: Peer id of the ledger channel. The app fills this in when it
+    #: creates the channel. Empty until then.
+    ledger_peer_id: int | None = None
+    #: Split one VOD into a chain of broadcasts of at most this many
+    #: hours each. YouTube archives a broadcast of 12 hours or less,
+    #: so the value must stay under 12. 0 turns splitting off, and a
+    #: VOD longer than 12 hours then loses its YouTube archive.
+    split_hours: NonNegativeFloat = 11
+    #: Cap on VODs per /archive run. 0 means no cap.
+    max_vods_per_run: int = Field(0, ge=0)
+
+    @field_validator("split_hours")
+    @classmethod
+    def _round_split_hours(cls, v: NonNegativeFloat) -> NonNegativeFloat:
+        """Keep the split length to the second, like the live split."""
+        return round(v, 4)
+
+
 class RecordingClaim(BaseModel):
     """One finished stream segment that may still get a recording.
 
@@ -573,6 +610,7 @@ class AppConfig(BaseModel):
     endpoint: EndpointConfig = EndpointConfig()
     mtproto: MtprotoConfig = MtprotoConfig()
     telegram_live: TelegramLiveConfig = TelegramLiveConfig()
+    archive: ArchiveConfig = ArchiveConfig()
     kick: KickConfig = KickConfig()
     api: ApiConfig = ApiConfig()
     web: WebConfig = WebConfig()

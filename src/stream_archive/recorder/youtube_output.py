@@ -284,14 +284,27 @@ class YoutubeOutputMixin:
         """Stop the keep-alive feed. Safe to call more than once."""
         await self._terminate(proc)
 
+    @staticmethod
+    def _note_part(entry: Recording, youtube_info: dict[str, Any]) -> None:
+        """Record one broadcast part's URL on the entry, when it tracks parts.
+
+        Only archive entries carry the list. Live entries leave it
+        absent, so live captures pay nothing for the archive ledger.
+        """
+        parts = entry.get("youtube_parts")
+        if parts is not None:
+            parts.append(youtube_info["youtube_url"])
+
     async def _release_broadcast(self, channel: str, youtube_info: dict[str, Any] | None, entry: Recording) -> None:
         """End the broadcast now, or hold it open for the configured delay."""
         if youtube_info is None:
             return
         delay = self._hold_seconds(channel)
-        if delay <= 0 or (entry.get("reused") and entry.get("failed")):
+        if delay <= 0 or entry.get("archive") or (entry.get("reused") and entry.get("failed")):
             # Zero delay means the feature is off. A reuse that failed left a
-            # dead broadcast, so holding it would only loop.
+            # dead broadcast, so holding it would only loop. An archive
+            # capture is a finished VOD: no streamer returns to reuse the
+            # broadcast, so it ends at once.
             await self._end_broadcast(channel, youtube_info["broadcast_id"])
             return
         old = self._held.pop(channel, None)
@@ -449,6 +462,7 @@ class YoutubeOutputMixin:
                 await self._end_broadcast(channel, youtube_info["broadcast_id"])
                 return
             entry["youtube_info"] = youtube_info
+            self._note_part(entry, youtube_info)
         entry["part_started_at"] = time.monotonic()
 
         if self._notifier and youtube_notify:
@@ -666,6 +680,10 @@ class YoutubeOutputMixin:
     def _part_end(self, entry: Any) -> float | None:
         """Monotonic time of the next split boundary, or None when off."""
         part = self._part_seconds()
+        if entry is not None and entry.get("part_seconds"):
+            # A per-capture length wins: archive mode splits at its own
+            # limit without changing the live split setting.
+            part = float(entry["part_seconds"])
         if part <= 0 or entry is None:
             return None
         started = entry.get("part_started_at") or entry.get("started_at")
@@ -704,6 +722,7 @@ class YoutubeOutputMixin:
                 await self._end_broadcast(channel, new_info["broadcast_id"])
             return None
         entry["youtube_info"] = new_info
+        self._note_part(entry, new_info)
         entry["part_started_at"] = time.monotonic()
         feeders.append(proc)
         stderr_drains.append((proc, asyncio.create_task(self._read_ffmpeg_stderr(channel, proc))))

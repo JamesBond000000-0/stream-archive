@@ -27,6 +27,7 @@ from stream_archive.http_client import build_http_client
 from stream_archive.telegram import menus
 from stream_archive.telegram import menus_callbacks as callbacks
 from stream_archive.telegram.commands_api import ApiCommands
+from stream_archive.telegram.commands_archive import ArchiveCommands
 from stream_archive.telegram.commands_channels import ChannelsCommands
 from stream_archive.telegram.commands_mtproto import MtprotoCommands
 from stream_archive.telegram.commands_settings import SettingsCommands
@@ -98,6 +99,7 @@ class TelegramController(
     SystemCommands,
     MtprotoCommands,
     YoutubeCommands,
+    ArchiveCommands,
 ):
     _config: AppConfig
     _recorder: Any
@@ -135,6 +137,7 @@ class TelegramController(
         mtproto: Any = None,
         uploads: Any = None,
         youtube_runner: Any = None,
+        archive_service: Any = None,
     ) -> None:
         self._config = config
         self._recorder = recorder
@@ -175,6 +178,7 @@ class TelegramController(
         self._youtube_tasks: set[asyncio.Task[None]] = set()
         self._youtube_sends: dict[tuple[ChatId, str], str] = {}
         self._youtube_runner = youtube_runner
+        self._archive_service = archive_service
         self._pending_delete: dict[tuple[ChatId, str], str] = {}
         self._pending_bulk_delete: dict[tuple[ChatId, str], str | None] = {}
         self._pending_yt_upload: dict[tuple[ChatId, str], str] = {}
@@ -246,6 +250,7 @@ class TelegramController(
             CommandHandler("hold", self._cmd_hold, filters=admin),
             CommandHandler("split", self._cmd_split, filters=admin),
             CommandHandler("vodupload", self._cmd_vodupload, filters=admin),
+            CommandHandler("archive", self._cmd_archive, filters=admin),
             CommandHandler("recordings", self._cmd_recordings, filters=admin),
             CommandHandler("settings", self._cmd_settings, filters=admin),
             CommandHandler("start", self._cmd_help, filters=admin),

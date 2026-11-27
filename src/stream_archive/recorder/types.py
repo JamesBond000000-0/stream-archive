@@ -77,6 +77,17 @@ class Recording(TypedDict, total=False):
     #: Monotonic start of the current YouTube broadcast. It moves at each
     #: split, while ``started_at`` stays at the start of the whole capture.
     part_started_at: float
+    #: True for an archive-mode capture (a past VOD restreamed to
+    #: YouTube). Archive captures end their broadcast at once instead
+    #: of holding it for a streamer who may return, and they skip the
+    #: live quick-end backoff.
+    archive: bool
+    #: Split length in seconds for this capture alone. It wins over
+    #: the live ``youtube.max_broadcast_hours`` value when set.
+    part_seconds: float
+    #: YouTube watch URLs of this capture, one per broadcast part, in
+    #: order. Archive mode reads the list to write its ledger entry.
+    youtube_parts: list[str]
 
 
 class HoldState(TypedDict):

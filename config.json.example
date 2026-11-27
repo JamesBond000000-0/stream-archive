@@ -76,6 +76,13 @@
         "post_chat_log": true,
         "forward_recording": true
     },
+    "archive": {
+        "enabled": false,
+        "ledger_channel_title": "Stream Archive Ledger",
+        "ledger_peer_id": null,
+        "split_hours": 11,
+        "max_vods_per_run": 0
+    },
     "retention_days": 0,
     "preferred_quality": "best",
     "max_concurrent_recordings": 0,
