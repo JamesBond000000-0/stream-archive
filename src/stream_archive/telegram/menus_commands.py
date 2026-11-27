@@ -36,6 +36,7 @@ class CommandsMixin:
     handle_global_hold: Any
     handle_split_hours: Any
     handle_channel_vod_upload: Any
+    handle_archive: Any
     _open_recordings: Any
     menu_text: Any
     reply_keyboard: Any
@@ -64,6 +65,7 @@ class CommandsMixin:
             BotCommand("hold", "Set global YouTube hold delay in seconds"),
             BotCommand("split", "Split a long YouTube restream into new broadcasts"),
             BotCommand("vodupload", "Set per-channel YouTube auto-upload (on, off)"),
+            BotCommand("archive", "Archive a channel's VODs to YouTube (twitch username)"),
             BotCommand("recordings", "Browse stored recordings"),
             BotCommand("settings", "Open the settings menu (reply keyboard buttons)"),
         ]
@@ -167,6 +169,9 @@ class CommandsMixin:
         await update.effective_message.reply_text(
             self.handle_channel_vod_upload(context.args or [], chat_id=self._chat_of(update))
         )
+
+    async def _cmd_archive(self, update: Any, context: Any) -> None:
+        await update.effective_message.reply_text(await self.handle_archive(context.args or []))
 
     async def _cmd_recordings(self, update: Any, context: Any) -> None:
         result = await self._open_recordings(self._chat_of(update))

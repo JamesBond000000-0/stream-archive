@@ -9,6 +9,7 @@ from aiohttp import web
 
 from stream_archive import events
 from stream_archive.api import ControlAPI
+from stream_archive.archive import ArchiveService
 from stream_archive.config import AppConfig, bare_name, get_config, is_kick_channel, telegram_enabled
 from stream_archive.eventsub import EventSubClient
 from stream_archive.http_client import build_http_client
@@ -253,6 +254,19 @@ async def run_scheduler() -> None:
             except Exception:
                 logger.warning("[mtproto] Connect failed at startup", exc_info=True)
 
+        # Archive mode runs behind /archive. It needs the recorder, the
+        # Twitch API, and the Telegram live streamer for its ledger.
+        # The streamer can be absent (telegram_live off): the service
+        # then refuses each run with the reason.
+        archive_service = ArchiveService(
+            config,
+            twitch_api,
+            recorder,
+            telegram_streamer,
+            notifier,
+            http=shared_http,
+        )
+
         telegram = TelegramController(
             config,
             recorder,
@@ -265,6 +279,7 @@ async def run_scheduler() -> None:
             mtproto=mtproto,
             uploads=upload_hub,
             youtube_runner=_youtube_runner,
+            archive_service=archive_service,
         )
         control_api = ControlAPI(config, telegram, recorder)
         control_api.register_routes(kick_webhook)

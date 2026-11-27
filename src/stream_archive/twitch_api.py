@@ -275,6 +275,34 @@ class TwitchAPI:
         data = resp.json()["data"]
         return data[0] if data else None
 
+    async def list_videos(self, user_id: str, video_type: str = "archive", max_pages: int = 20) -> list[dict[str, Any]]:
+        """List one user's videos of a type, newest first, across pages.
+
+        Archive mode reads a channel's past broadcasts from here. The
+        page cap keeps a huge backlog from paging forever: at 100
+        videos per page the cap still returns 2,000 videos, and the
+        log names the cut when it hits.
+        """
+        videos: list[dict[str, Any]] = []
+        after: str | None = None
+        for _ in range(max_pages):
+            params: dict[str, Any] = {"user_id": user_id, "type": video_type, "first": 100}
+            if after:
+                params["after"] = after
+            resp = await self._request("GET", "https://api.twitch.tv/helix/videos", params=params)
+            resp.raise_for_status()
+            payload = resp.json()
+            videos.extend(payload.get("data") or [])
+            after = (payload.get("pagination") or {}).get("cursor")
+            if not after:
+                return videos
+        logger.warning(
+            "[twitch_api] video list stopped at the %d-page cap (%d items): the list is partial",
+            max_pages,
+            len(videos),
+        )
+        return videos
+
     async def get_games_by_names(self, names: list[str]) -> dict[str, str]:
         """Map each known name (lowercased) to its canonical Twitch game name.
 
